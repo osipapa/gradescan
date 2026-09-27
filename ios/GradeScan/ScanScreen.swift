@@ -4,7 +4,6 @@ import SwiftUI
 struct ScanScreen: View {
     @EnvironmentObject var store: AppStore
     @EnvironmentObject var scan: ScanSession
-    @State private var showSettings = false
     @State private var confirmDiscardBatch = false
 
     var body: some View {
@@ -13,6 +12,7 @@ struct ScanScreen: View {
             VStack(spacing: 10) {
                 topBar
                 if let id = scan.rescanning { rescanBanner(id) }
+                if scan.capturingKey { keyBanner }
                 if let note = scan.note {
                     Text(note).font(.subheadline.weight(.medium)).foregroundStyle(.white)
                         .padding(.horizontal, 16).padding(.vertical, 10).glassCapsule()
@@ -27,14 +27,14 @@ struct ScanScreen: View {
                     .foregroundStyle(.white)
                     .glassCapsule()
                 }
-                pill
+                if scan.zipgradeNeedsTest && scan.rescanning == nil { zipgradePrompt } else { pill }
                 if store.problem != nil && !store.pending.isEmpty {
                     Text("\(store.pending.count) waiting to upload. It keeps trying.").font(.footnote).foregroundStyle(.white.opacity(0.85))
                         .padding(.horizontal, 14).padding(.vertical, 8).glassCapsule()
                 } else if !store.pending.isEmpty {
                     Text("Uploading \(store.pending.count)…").font(.footnote).foregroundStyle(.white.opacity(0.85))
                 }
-                if scan.rescanning == nil {
+                if scan.rescanning == nil && !scan.capturingKey {
                     if scan.mode == .batch { tray } else if !scan.items.isEmpty { reviewBatchButton }
                     modePicker
                 }
@@ -46,14 +46,16 @@ struct ScanScreen: View {
         .sheet(item: $scan.card, onDismiss: scan.cardDismissed) { ref in
             ItemCardSheet(id: ref.id).environmentObject(store).environmentObject(scan)
         }
-        .sheet(isPresented: $showSettings) { SettingsView().environmentObject(store).environmentObject(scan) }
         .confirmationDialog("Discard this batch?", isPresented: $confirmDiscardBatch, titleVisibility: .visible) {
             Button("Discard \(scan.items.count) scans", role: .destructive) { scan.discardBatch() }
         } message: {
             Text("They're deleted here and in the portal.")
         }
-        .sheet(isPresented: $scan.askZipGrade, onDismiss: { if scan.askZipGrade == false && scan.zipgradeQuizId == nil { scan.zipgradeAskDismissed() } }) {
+        .sheet(isPresented: $scan.askZipGrade) {
             ZipGradeTestPicker().environmentObject(store).environmentObject(scan)
+        }
+        .sheet(item: $scan.keyDraft, onDismiss: { if scan.capturingKey { scan.keyTestDone(nil) } }) { draft in
+            NewTestView(draft: draft) { quiz in scan.keyTestDone(quiz) }.environmentObject(store)
         }
         .fullScreenCover(isPresented: $scan.showReview, onDismiss: scan.reviewClosed) {
             ReviewScreen().environmentObject(store).environmentObject(scan)
@@ -79,13 +81,48 @@ struct ScanScreen: View {
             .glassCapsule()
             .accessibilityLabel(scan.torch ? "Turn flashlight off" : "Turn flashlight on")
             Spacer()
-            Button { showSettings = true } label: {
-                Image(systemName: "gearshape").font(.title3).frame(width: 46, height: 46)
-            }
-            .glassCapsule()
-            .accessibilityLabel("Settings")
         }
         .foregroundStyle(.white)
+    }
+
+    /// A ZipGrade sheet is in view and this batch has no test for it yet.
+    private var zipgradePrompt: some View {
+        let hasTests = store.tests.contains(where: ZipGrade.fits)
+        return VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("ZipGrade sheet").font(.headline)
+                Text(hasTests ? "Which test is it for?" : "Set up its test from an answer key: a sheet with every answer right.")
+                    .font(.subheadline).foregroundStyle(.white.opacity(0.85))
+            }
+            HStack(spacing: 10) {
+                if hasTests {
+                    Button { scan.askZipGrade = true } label: { Text("Choose test").bold().frame(maxWidth: .infinity) }
+                        .primaryButton()
+                }
+                Button { scan.startKeyCapture() } label: { Text("Scan answer key").frame(maxWidth: .infinity) }
+                    .buttonStyle(.bordered)
+                    .tint(.white)
+            }
+            .controlSize(.large)
+        }
+        .foregroundStyle(.white)
+        .padding(16)
+        .glassPanel()
+    }
+
+    private var keyBanner: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "key").font(.title3)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Answer key").font(.headline)
+                Text("Hold up a sheet with every answer right").font(.caption).lineLimit(1)
+            }
+            Spacer()
+            Button("Cancel") { scan.cancelKeyCapture() }.bold()
+        }
+        .foregroundStyle(.white)
+        .padding(14)
+        .glassPanel()
     }
 
     private func rescanBanner(_ id: String) -> some View {
@@ -127,9 +164,9 @@ struct ScanScreen: View {
     private var tray: some View {
         HStack(spacing: 8) {
             if scan.items.isEmpty {
-                Text("Scan the sheets one after another, then tap Done.")
+                Text("Scan your sheets")
                     .font(.footnote).foregroundStyle(.white.opacity(0.9))
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .center)
                     .padding(.vertical, 8)
             } else {
                 Button { confirmDiscardBatch = true } label: {
@@ -146,7 +183,7 @@ struct ScanScreen: View {
                     Text("Review").font(.headline).padding(.horizontal, 22).padding(.vertical, 11)
                 }
                 .background(Brand.sage, in: Capsule())
-                .foregroundStyle(Brand.ink)
+                .foregroundStyle(Brand.onSage)
             }
         }
         .padding(10)
@@ -223,7 +260,7 @@ struct ZipGradeTestPicker: View {
         NavigationStack {
             List {
                 Section {
-                    Text("ZipGrade sheets don't say which test they're for. Pick the one with the right answer key; ZipGrade sheets go to it until you change it.")
+                    Text("ZipGrade sheets don't say which test they're for. Pick the one with the right answer key; this batch's ZipGrade sheets go to it.")
                         .font(.subheadline).foregroundStyle(.secondary)
                 }
                 Section("Your tests") {
@@ -246,10 +283,13 @@ struct ZipGradeTestPicker: View {
                     }
                 }
                 Section {
-                    Button("New test") {
+                    Button("New test from an answer key sheet") { scan.startKeyCapture() }
+                    Button("Set up a new test by hand") {
                         before = Set(store.tests.map(\.id))
                         creating = true
                     }
+                } footer: {
+                    Text("From an answer key: hold up a sheet with every answer right, then name the test.")
                 }
             }
             .navigationTitle("ZipGrade sheets")

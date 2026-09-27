@@ -5,7 +5,7 @@ import Foundation
 enum SheetDesign {
     static let fid = 0.25, fidAt = 0.2, border = 0.43, pad = 0.1
     static let r = 0.09, dx = 0.26, dy = 0.28, label = 0.26, gap = 0.2, periods = 9, pdx = 0.25
-    static let periodY = 1.2, top = 1.74
+    static let dateY = 1.24, periodY = 1.48, top = 2.02
 
     static func layout(questions n: Int, choices c: Int) -> SheetLayout {
         let rows = (n + 1) / 2, cols = n > 1 ? 2 : 1
@@ -24,7 +24,8 @@ enum SheetDesign {
             marker: [a, r3(a + 0.35 * (h - 2 * a))],
             questions: questions,
             period: (0..<periods).map { k in [r3(x0 + 0.5 + r + Double(k) * pdx), periodY] },
-            name: [r3(nameX), 0.7, r3(w - x0 - nameX), 0.32])
+            name: [r3(nameX), 0.7, r3(w - x0 - nameX), 0.32],
+            dateBox: [r3(nameX), r3(dateY - 0.26), 1.4, 0.32])
     }
 
     private static func r3(_ x: Double) -> Double { (x * 1000).rounded() / 1000 }

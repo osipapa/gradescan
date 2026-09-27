@@ -20,19 +20,20 @@ struct SheetLayout: Codable, Sendable {
 
     var cornerPoints: [CGPoint] { corners.map(Self.point) }
 
-    /// Rings just outside a bubble where strokes leaving it (an X over it) are looked for, in bubble radii: clear
-    /// of its own printed circle and of the neighboring bubbles, which sit closer together on some sheets.
-    var armsRadii: [Double] {
-        guard let row = questions.first, row.count > 1, r > 0 else { return [1.35, 1.5] }
-        let neighbor = hypot(row[1][0] - row[0][0], row[1][1] - row[0][1]) / r - 1   // where the next circle begins
-        return neighbor >= 1.7 ? [1.35, 1.5] : [1.1, max(1.12, min(1.35, neighbor - 0.1))]
+    /// Whether a row's bubbles sit so close that the ring just past one runs into the next (ZipGrade).
+    var tight: Bool {
+        guard let row = questions.first, row.count > 1, r > 0 else { return false }
+        return hypot(row[1][0] - row[0][0], row[1][1] - row[0][1]) / r - 1 < 1.7   // where the next circle begins
     }
+
+    /// Rings outside a bubble where strokes leaving it (an X over it) are looked for, in bubble radii: clear of its
+    /// own printed circle even when the sheet is a little off, and past where a heavy fill spills over. On tight
+    /// sheets only above, below and the diagonals are looked at (see `Reader.inspect`), where there's room.
+    var armsRadii: [Double] { [1.35, 1.5] }
 
     /// How dark a stroke past the circle must be to count. Where printed grey circles sit close by (ZipGrade),
     /// only pen and pencil dark enough to stand out from them count.
-    var armsContrast: Double {
-        armsRadii == [1.35, 1.5] ? Reader.inkContrast : 0.4
-    }
+    var armsContrast: Double { tight ? 0.4 : Reader.inkContrast }
     var markerPoint: CGPoint { Self.point(marker) }
 
     func bubble(_ question: Int, _ choice: Int) -> CGPoint? {
@@ -176,12 +177,14 @@ enum Reader {
 
     /// The test code printed as 16 small squares between the bottom corner squares (see `codeBits` in the portal),
     /// or nil if it doesn't read cleanly. `unit` maps corner-to-corner coordinates to normalized image points.
-    static func testCode(_ img: LumaImage, _ unit: Homography) -> Int? { code(img, unit, row: 1) }
+    /// `strict` also wants every square clearly printed or clearly blank, with paper between them: filled bubbles
+    /// that happen to line up like a sheet's corners pass the 4-bit check one time in 16, but not that.
+    static func testCode(_ img: LumaImage, _ unit: Homography, strict: Bool = false) -> Int? { code(img, unit, row: 1, strict: strict) }
 
     /// The student number on a named sheet, printed the same way between the top corner squares.
     static func studentNumber(_ img: LumaImage, _ unit: Homography) -> Int? { code(img, unit, row: 0) }
 
-    private static func code(_ img: LumaImage, _ unit: Homography, row v: Double) -> Int? {
+    private static func code(_ img: LumaImage, _ unit: Homography, row v: Double, strict: Bool = false) -> Int? {
         let width = Double(img.width), height = Double(img.height)
         var word = 0
         for i in 0..<16 {
@@ -196,7 +199,13 @@ enum Reader {
                 return max(best, at(ring * cos(a), ring * sin(a)))
             }
             guard paper > 0 else { return nil }
-            if 1 - ink / paper >= 0.35 { word |= 1 << i }
+            let contrast = 1 - ink / paper
+            if strict {
+                guard contrast >= 0.5 || contrast <= 0.15 else { return nil }
+                let gap = unit.apply(CGPoint(x: u + 0.02, y: v))   // between this square and the next
+                guard i == 15 || 1 - img.at(gap) / paper <= 0.15 else { return nil }
+            }
+            if contrast >= 0.35 { word |= 1 << i }
         }
         let code = word & 4095, check = word >> 12
         guard code > 0, check == (code & 15) ^ ((code >> 4) & 15) ^ ((code >> 8) & 15) ^ 10 else { return nil }
@@ -233,16 +242,29 @@ enum Reader {
     }
 
     static func inspect(_ c: CGPoint, radius r: Double, _ img: LumaImage, _ h: Homography, arms armsRadii: [Double] = [1.35, 1.5],
-                        armsContrast: Double = inkContrast, thorough: Bool = true) -> Bubble {
+                        armsContrast: Double = inkContrast, tight: Bool = false, thorough: Bool = true) -> Bubble {
         let luma: (Double, Double) -> Double? = { x, y in img.smooth(h.apply(CGPoint(x: c.x + r * x, y: c.y + r * y))) }
         let paper = ring.reduce(0.0) { max($0, luma($1.x, $1.y) ?? 0) }
         guard paper > 0 else { return .empty }
         let ink: (Double, Double) -> Double = { x, y in max(0, 1 - (luma(x, y) ?? paper) / paper) }
         let inside = disk.map { ink($0.x, $0.y) }.filter { $0 > inkContrast }
+        // Beside a bubble on a tight sheet is its neighbor, so only directions at least 36° off the row count there.
+        let looked: (Int) -> Bool = { k in !tight || abs(sin(Double(k) * 2 * .pi / Double(spokes))) >= sin(.pi / 5) }
         let around: ([Double], Double) -> [Bool] = { radii, contrast in
             (0..<spokes).map { k in
                 let a = Double(k) * 2 * .pi / Double(spokes)
-                return radii.contains { ink($0 * cos(a), $0 * sin(a)) > contrast }
+                return looked(k) && radii.contains { ink($0 * cos(a), $0 * sin(a)) > contrast }
+            }
+        }
+        let lookedCount = Double((0..<spokes).filter(looked).count)
+        // On tight sheets, where strokes are only looked for in some directions, each spoke past the circle stands
+        // for its whole 10° slice, so a thin pencil stroke can't pass between two spokes.
+        let slices: ([Double], Double) -> [Bool] = { radii, contrast in
+            (0..<spokes).map { k in
+                looked(k) && (tight ? [-1.0 / 3, 0, 1.0 / 3] : [0]).contains { part in
+                    let a = (Double(k) + part) * 2 * .pi / Double(spokes)
+                    return radii.contains { ink($0 * cos(a), $0 * sin(a)) > contrast }
+                }
             }
         }
         let coverage = Double(inside.count) / Double(disk.count)
@@ -251,7 +273,7 @@ enum Reader {
         // Past the printed circle, far enough out that the circle itself doesn't show up when the sheet is a little
         // off. A fill that spills over leaves on one side; an X drawn over the bubble leaves in three or more
         // directions; a slash leaves on two opposite sides; a circle drawn around it is all around.
-        let outer = around(armsRadii, armsContrast), leaving = runs(outer).filter { $0.length <= 6 }   // strokes, not a printed circle
+        let outer = slices(armsRadii, armsContrast), leaving = runs(outer).filter { $0.length <= 6 }   // strokes, not a printed circle
         let opposite = leaving.count == 2 && leaving.allSatisfy { $0.length <= 2 }
             && abs(angularDistance(leaving[0].center, leaving[1].center) - Double(spokes / 2)) <= 3
         // Inside: an X crosses a ring around the middle in three to five short strokes; a fill, scribble or loop
@@ -260,9 +282,10 @@ enum Reader {
             let circle = around([radius], inkContrast), strokes = runs(circle)
             return share(circle) <= 0.4 && (3...5).contains(strokes.count) && strokes.allSatisfy { $0.length <= 8 }
         }
+        let outerShare = Double(outer.filter { $0 }.count) / lookedCount
         return Bubble(coverage: coverage, tone: inside.isEmpty ? 0 : inside.reduce(0, +) / Double(inside.count),
-                      crossedOut: share(outer) <= 0.45 && (directions(leaving) >= 3 || opposite),
-                      xMark: xMark, circled: share(outer) >= 0.6, arms: directions(leaving))
+                      crossedOut: outerShare <= 0.45 && (directions(leaving) >= 3 || opposite),
+                      xMark: xMark, circled: outerShare >= 0.6, arms: directions(leaving))
     }
 
     private static func share(_ around: [Bool]) -> Double { Double(around.filter { $0 }.count) / Double(max(1, around.count)) }
@@ -361,13 +384,13 @@ enum Reader {
     /// Period (nil if not marked clearly) and one character per question: A–E, "-" blank, "*" rejected (more than one
     /// answer), "?" can't tell. With `align` (for the photo), bubbles are first nudged onto their printed circles.
     static func read(_ quiz: Quiz, _ layout: SheetLayout, _ img: LumaImage, _ h: Homography, align: Bool = false) -> (period: Int?, answers: String, marks: [Int: String]) {
-        let r = layout.r, arms = layout.armsRadii, armsContrast = layout.armsContrast
+        let r = layout.r, arms = layout.armsRadii, armsContrast = layout.armsContrast, tight = layout.tight
         let rows = [layout.period] + layout.questions.prefix(min(quiz.numQuestions, layout.questions.count)).map { Array($0.prefix(min(quiz.numChoices, 5))) }
         let fix = align ? correction(rows.flatMap { $0.map(SheetLayout.point) }, radius: r, img, h) : { _ in .zero }
         let bubbles: ([[Double]]) -> [Bubble] = { centers in
             centers.map(SheetLayout.point).map { c in
                 let d = fix(c)
-                return inspect(CGPoint(x: c.x + d.x, y: c.y + d.y), radius: r, img, h, arms: arms, armsContrast: armsContrast, thorough: align)
+                return inspect(CGPoint(x: c.x + d.x, y: c.y + d.y), radius: r, img, h, arms: arms, armsContrast: armsContrast, tight: tight, thorough: align)
             }
         }
         let p = rows[0].isEmpty ? -1 : choose(bubbles(rows[0]))
@@ -492,9 +515,14 @@ enum Reader {
         ctx.translateBy(x: 0, y: CGFloat(height)); ctx.scaleBy(x: ppi, y: -ppi)   // sheet inches, top-left origin
         ctx.setLineWidth(0.03); ctx.setLineCap(.round); ctx.setLineJoin(.round)
         for path in MarkPaths(marks, radius: layout.r).all {
-            ctx.setStrokeColor(path.color)
             ctx.addPath(path.path)
-            ctx.strokePath()
+            if path.fill {
+                ctx.setFillColor(path.color)
+                ctx.fillPath()
+            } else {
+                ctx.setStrokeColor(path.color)
+                ctx.strokePath()
+            }
         }
         guard let image = ctx.makeImage() else { return nil }
         let data = NSMutableData()
@@ -563,15 +591,16 @@ enum Grader {
 func fmt(_ x: Double) -> String { String(format: "%g", x) }
 
 /// The strokes for a set of marks, in sheet inches: a ✓ or ✗ by each question number, like a teacher's pen, the right
-/// answer ringed in grey on a miss, and an amber dot on a row waiting for the teacher.
+/// answer ringed in yellow, like a highlighter, on a miss, and an amber dot on a row waiting for the teacher.
 struct MarkPaths {
-    struct Colored { let path: CGPath; let color: CGColor }
+    struct Colored { let path: CGPath; let color: CGColor; var fill = false }
     static let green = CGColor(red: 0.18, green: 0.72, blue: 0.3, alpha: 1)
     static let red = CGColor(red: 0.93, green: 0.2, blue: 0.16, alpha: 1)
     static let amber = CGColor(red: 1, green: 0.72, blue: 0.1, alpha: 1)
-    static let grey = CGColor(red: 0.45, green: 0.45, blue: 0.45, alpha: 1)
+    static let key = CGColor(red: 0.98, green: 0.72, blue: 0, alpha: 1)
+    static let keyFill = CGColor(red: 1, green: 0.8, blue: 0, alpha: 0.3)
 
-    let green = CGMutablePath(), red = CGMutablePath(), amber = CGMutablePath(), grey = CGMutablePath()
+    let green = CGMutablePath(), red = CGMutablePath(), amber = CGMutablePath(), key = CGMutablePath()
 
     init(_ marks: [Mark], radius r: Double) {
         let s = 0.075   // half-size of the ✓ and ✗
@@ -587,13 +616,14 @@ struct MarkPaths {
             } else {
                 red.move(to: CGPoint(x: c.x - s, y: c.y - s)); red.addLine(to: CGPoint(x: c.x + s, y: c.y + s))
                 red.move(to: CGPoint(x: c.x - s, y: c.y + s)); red.addLine(to: CGPoint(x: c.x + s, y: c.y - s))
-                if let k = m.correct { grey.addEllipse(in: CGRect(x: k.x - r - 0.03, y: k.y - r - 0.03, width: 2 * (r + 0.03), height: 2 * (r + 0.03))) }
+                if let k = m.correct { key.addEllipse(in: CGRect(x: k.x - r - 0.03, y: k.y - r - 0.03, width: 2 * (r + 0.03), height: 2 * (r + 0.03))) }
             }
         }
     }
 
     var all: [Colored] {
-        [Colored(path: grey, color: Self.grey), Colored(path: green, color: Self.green), Colored(path: red, color: Self.red), Colored(path: amber, color: Self.amber)]
+        [Colored(path: key, color: Self.keyFill, fill: true), Colored(path: key, color: Self.key),
+         Colored(path: green, color: Self.green), Colored(path: red, color: Self.red), Colored(path: amber, color: Self.amber)]
     }
 }
 

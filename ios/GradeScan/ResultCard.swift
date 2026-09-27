@@ -551,8 +551,12 @@ struct SheetMarks: View {
                 }
             }
             for part in MarkPaths(marks, radius: layout.r).all {
-                ctx.stroke(Path(part.path), with: .color(Color(cgColor: part.color)),
-                           style: StrokeStyle(lineWidth: 0.032, lineCap: .round, lineJoin: .round))
+                if part.fill {
+                    ctx.fill(Path(part.path), with: .color(Color(cgColor: part.color)))
+                } else {
+                    ctx.stroke(Path(part.path), with: .color(Color(cgColor: part.color)),
+                               style: StrokeStyle(lineWidth: 0.032, lineCap: .round, lineJoin: .round))
+                }
             }
         }
         .allowsHitTesting(false)

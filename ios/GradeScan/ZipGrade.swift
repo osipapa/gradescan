@@ -43,6 +43,27 @@ enum ZipGrade {
                            dateBox: [1.07, 0.53, 0.99, 0.31])    // the Date field
     }()
 
+    /// Whether a candidate really is a ZipGrade form: its printed circles sit where the layout puts the bubbles
+    /// (darker on the circle than on the paper just outside), which filled bubbles lined up like squares can't fake.
+    static func looksReal(_ img: LumaImage, corners: [CGPoint]) -> Bool {
+        let layout = form20
+        guard let map = Homography(layout.cornerPoints, corners) else { return false }
+        var hits = 0, tried = 0
+        for q in [0, 4, 9, 10, 14, 19] {
+            for c in [0, 2, 4] {
+                let p = SheetLayout.point(layout.questions[q][c]), r = layout.r
+                let at: (Double, Double) -> Double = { a, k in img.at(map.apply(CGPoint(x: p.x + k * r * cos(a), y: p.y + k * r * sin(a)))) }
+                let angles = (0..<8).map { Double($0) * .pi / 4 }
+                // The printed line is thin, so look just inside, on, and just outside it and keep the darkest.
+                let circle = angles.reduce(0) { sum, a in sum + [0.84, 0.92, 1.0].map { at(a, $0) }.min()! } / 8
+                let paper = [Double.pi / 2, 3 * .pi / 2].map { at($0, 1.5) }.max() ?? 0   // above and below: rows are far apart
+                tried += 1
+                if paper > 0 && circle < 0.9 * paper { hits += 1 }
+            }
+        }
+        return hits * 3 >= tried * 2
+    }
+
     /// A test a ZipGrade stack can be for: at most 20 questions, A–E.
     static func fits(_ quiz: Quiz) -> Bool { quiz.numQuestions <= 20 && quiz.numChoices <= 5 }
 

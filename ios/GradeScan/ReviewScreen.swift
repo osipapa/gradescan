@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// After a batch: swipe through the sheets and approve or reject each one. Rejecting is instant; swipe back and
-/// tap Undo to take it back. Rejected sheets are deleted when you finish.
+/// After a batch: swipe through the sheets. Next when a sheet looks right; delete or rescan one that doesn't.
+/// Deleting is instant; swipe back and tap Undo to take it back. Deleted sheets go when you finish.
 struct ReviewScreen: View {
     @EnvironmentObject var store: AppStore
     @EnvironmentObject var scan: ScanSession
@@ -22,7 +22,7 @@ struct ReviewScreen: View {
                     }
                     .overlay(alignment: .top) {
                         if item.rejected {
-                            Text("Rejected").font(.headline).padding(.horizontal, 16).padding(.vertical, 8)
+                            Text("Deleted").font(.headline).padding(.horizontal, 16).padding(.vertical, 8)
                                 .background(.regularMaterial, in: Capsule()).padding(.top, 12)
                         }
                     }
@@ -56,20 +56,27 @@ struct ReviewScreen: View {
         HStack(spacing: 10) {
             if item.rejected {
                 Button { scan.unreject(item.id) } label: {
-                    Label("Undo reject", systemImage: "arrow.uturn.backward").frame(maxWidth: .infinity)
+                    Label("Undo delete", systemImage: "arrow.uturn.backward").frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
             } else {
+                // Looks right: Next. Wrong sheet or a bad capture: delete it or scan it again.
                 Button { advance(from: item.id) { scan.reject(item.id) } } label: {
-                    Label("Reject", systemImage: "xmark").frame(maxWidth: .infinity)
+                    Image(systemName: "trash").frame(width: 30)
                 }
                 .buttonStyle(.bordered)
+                .accessibilityLabel("Delete")
                 Button { scan.startRescan(item.id) } label: {
-                    Label("Rescan", systemImage: "camera.viewfinder").frame(maxWidth: .infinity)
+                    Text("Rescan").lineLimit(1).frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
                 Button { advance(from: item.id) { scan.approve(item.id) } } label: {
-                    Label(item.reviewed ? "Approved" : "Approve", systemImage: "checkmark").bold().frame(maxWidth: .infinity)
+                    HStack(spacing: 6) {
+                        Text("Next").bold()
+                        Image(systemName: "chevron.right").font(.subheadline.weight(.semibold))
+                    }
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity)
                 }
                 .primaryButton()
             }
@@ -91,7 +98,7 @@ struct ReviewScreen: View {
             Image(systemName: "checkmark.circle.fill").font(.system(size: 60)).foregroundStyle(Brand.sage)
             Text(scan.items.isEmpty ? "Nothing to review" : "\(kept.count) saved").font(.largeTitle.bold())
             Group {
-                if rejected > 0 { Text("\(rejected) rejected; they're deleted when you finish") }
+                if rejected > 0 { Text("\(rejected) deleted") }
                 if scan.undecided > 0 { Text("\(scan.undecided) not looked at yet; swipe back to check them") }
                 if let average = scan.average { Text("Average \(Int(average.rounded()))%") }
             }

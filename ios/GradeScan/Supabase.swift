@@ -13,6 +13,18 @@ struct Session: Codable, Sendable {
     var userId: String
     var expiresAt: Date
     var email: String?
+
+    /// The account's email: saved at sign-in, or read from the access token (sessions from earlier versions didn't save it).
+    var accountEmail: String? {
+        if let email, !email.isEmpty { return email }
+        let parts = accessToken.split(separator: ".")
+        guard parts.count > 1 else { return nil }
+        var payload = String(parts[1]).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        while payload.count % 4 != 0 { payload += "=" }
+        guard let data = Data(base64Encoded: payload),
+              let claims = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return claims["email"] as? String
+    }
 }
 
 /// A test as created in the portal. `layout` says where everything is printed on its answer sheet.
@@ -26,6 +38,10 @@ struct Quiz: Codable, Identifiable, Sendable {
     let bonusCount: Int
     let layout: SheetLayout?
     let code: String?
+    var questionTags: [String]? = nil   // one topic per question, set in the portal; "" = none
+
+    /// Question i's topic, if it has one.
+    func topic(_ i: Int) -> String? { questionTags.flatMap { $0.indices.contains(i) && !$0[i].isEmpty ? $0[i] : nil } }
 
     /// The number printed on this test's sheets, which is how the phone recognizes them.
     var sheetCode: Int? { code.flatMap { Int($0) }.flatMap { (1...4095).contains($0) ? $0 : nil } }
@@ -107,9 +123,10 @@ extension ScanRecord {
     }
 }
 
-/// Just enough of every scan to show each test's count and average.
+/// Just enough of every scan to show each test's and each student's count and average.
 struct ScanSummaryRow: Codable, Sendable {
     let quizId: String
+    let studentId: String?
     let answers: String
     let scoreOverride: Double?
 }
@@ -181,7 +198,7 @@ enum API {
 
     /// Newest first.
     static func tests(_ token: String) async throws -> [Quiz] {
-        let data = try await request("/rest/v1/quizzes?select=id,title,num_questions,num_choices,answer_key,points_per_question,bonus_count,layout,code&order=created_at.desc", token: token)
+        let data = try await request("/rest/v1/quizzes?select=id,title,num_questions,num_choices,answer_key,points_per_question,bonus_count,layout,code,question_tags&order=created_at.desc", token: token)
         return try decoder.decode([Quiz].self, from: data)
     }
 
@@ -205,8 +222,56 @@ enum API {
     }
 
     static func scanSummaries(_ token: String) async throws -> [ScanSummaryRow] {
-        let data = try await request("/rest/v1/scans?select=quiz_id,answers,score_override", token: token)
+        let data = try await request("/rest/v1/scans?select=quiz_id,student_id,answers,score_override", token: token)
         return try decoder.decode([ScanSummaryRow].self, from: data)
+    }
+
+    /// A student's scans across tests, newest first.
+    static func scans(studentId: String, _ token: String) async throws -> [ScanRecord] {
+        let data = try await request("/rest/v1/scans?student_id=eq.\(studentId)&select=id,quiz_id,period,student_id,student_name,name_image,answers,score_override,scanned_at,photo_path,review,form,taken_on&order=scanned_at.desc", token: token)
+        return try decoder.decode([ScanRecord].self, from: data)
+    }
+
+    static func updateStudent(_ id: String, name: String, period: Int?, _ token: String) async throws {
+        struct Row: Encodable {
+            let name: String, period: Int?
+            func encode(to encoder: Encoder) throws {   // send a null period too, so clearing it works
+                var c = encoder.container(keyedBy: CodingKeys.self)
+                try c.encode(name, forKey: .name)
+                try c.encode(period, forKey: .period)
+            }
+            enum CodingKeys: String, CodingKey { case name, period }
+        }
+        _ = try await request("/rest/v1/students?id=eq.\(id)", method: "PATCH", token: token, body: try encoder.encode(Row(name: name, period: period)), prefer: "return=minimal")
+    }
+
+    /// Their scans stay, without the student.
+    static func deleteStudent(_ id: String, _ token: String) async throws {
+        _ = try await request("/rest/v1/students?id=eq.\(id)", method: "DELETE", token: token)
+    }
+
+    static func deleteStudents(_ ids: [String], _ token: String) async throws {
+        guard !ids.isEmpty else { return }
+        _ = try await request("/rest/v1/students?id=in.(\(ids.joined(separator: ",")))", method: "DELETE", token: token)
+    }
+
+    // TESTING ONLY — remove before production (with AppStore.wipeEverything and the Testing section in SettingsView).
+    /// Deletes every scan, student, test and sheet photo on the signed-in account.
+    static func wipeEverything(userId: String, _ token: String) async throws {
+        struct Object: Decodable { let name: String }
+        struct List: Encodable { let prefix: String; let limit: Int; let offset: Int }
+        struct Remove: Encodable { let prefixes: [String] }
+        while true {
+            let data = try await request("/storage/v1/object/list/sheets", method: "POST", token: token,
+                                         body: try JSONEncoder().encode(List(prefix: userId, limit: 1000, offset: 0)))
+            let names = try JSONDecoder().decode([Object].self, from: data).map { "\(userId)/\($0.name)" }
+            if names.isEmpty { break }
+            _ = try await request("/storage/v1/object/sheets", method: "DELETE", token: token, body: try JSONEncoder().encode(Remove(prefixes: names)))
+        }
+        // Row-level security limits each delete to this account's rows; PostgREST wants a filter on every delete.
+        for table in ["scans", "students", "quizzes"] {
+            _ = try await request("/rest/v1/\(table)?id=not.is.null", method: "DELETE", token: token)
+        }
     }
 
     /// A marked sheet photo from the private "sheets" bucket.

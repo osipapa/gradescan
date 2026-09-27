@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Scan and Tests, one tap apart.
+/// Scan, Tests, Students and Settings, one tap apart.
 struct MainTabs: View {
     @EnvironmentObject var store: AppStore
 
@@ -8,6 +8,8 @@ struct MainTabs: View {
         TabView(selection: $store.tab) {
             ScanScreen().tabItem { Label("Scan", systemImage: "viewfinder") }.tag(AppStore.Tab.scan)
             TestsView().tabItem { Label("Tests", systemImage: "list.bullet.rectangle") }.tag(AppStore.Tab.tests)
+            StudentsView().tabItem { Label("Students", systemImage: "person.2") }.tag(AppStore.Tab.students)
+            SettingsView().tabItem { Label("Settings", systemImage: "gearshape") }.tag(AppStore.Tab.settings)
         }
     }
 }
@@ -55,6 +57,11 @@ struct TestsView: View {
 struct NewTestView: View {
     @EnvironmentObject var store: AppStore
     @Environment(\.dismiss) private var dismiss
+    /// An answer key read from a sheet, filled in to check; `done` hears the new test (nil if cancelled).
+    var draft: KeyDraft? = nil
+    var done: ((Quiz?) -> Void)? = nil
+    @State private var filled = false
+    @FocusState private var naming: Bool
     @State private var title = ""
     @State private var questions = 20
     @State private var choices = 4
@@ -66,8 +73,15 @@ struct NewTestView: View {
     var body: some View {
         NavigationStack {
             Form {
+                if draft != nil {
+                    Section {
+                        Text("Read from the answer key sheet. Check the answers, give the test a name, and create it.")
+                            .font(.subheadline).foregroundStyle(.secondary)
+                    }
+                }
                 Section {
                     TextField("Name (same as in Jupiter)", text: $title)
+                        .focused($naming)
                     Stepper("\(questions) questions", value: $questions, in: 1...50)
                     Picker("Answer choices", selection: $choices) {
                         ForEach(2...5, id: \.self) { Text("A–\(String(Grader.letters[$0 - 1]))").tag($0) }
@@ -94,10 +108,23 @@ struct NewTestView: View {
             }
             .navigationTitle("New test")
             .navigationBarTitleDisplayMode(.inline)
+            .onAppear {
+                guard let draft, !filled else { return }
+                filled = true
+                questions = max(1, draft.key.count)
+                choices = draft.choices
+                key = draft.key + Array(repeating: nil, count: max(0, 20 - draft.key.count))
+                naming = true
+            }
             .onChange(of: questions) { _, n in key = (0..<n).map { $0 < key.count ? key[$0] : nil } }
             .onChange(of: choices) { _, c in key = key.map { $0.flatMap { Grader.letters.prefix(c).contains($0) ? $0 : nil } } }
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        done?(nil)
+                        dismiss()
+                    }
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button(saving ? "Saving…" : "Create") { save() }.disabled(!ready || saving)
                 }
@@ -113,8 +140,9 @@ struct NewTestView: View {
         saving = true
         let answerKey = String(key.prefix(questions).compactMap { $0 })
         Task {
-            if await store.createTest(title: title.trimmingCharacters(in: .whitespaces), questions: questions, choices: choices,
-                                      key: answerKey, points: points, bonus: bonus) {
+            if let quiz = await store.createTest(title: title.trimmingCharacters(in: .whitespaces), questions: questions, choices: choices,
+                                                 key: answerKey, points: points, bonus: bonus) {
+                done?(quiz)
                 dismiss()
             }
             saving = false
@@ -129,7 +157,7 @@ struct BubbleStyle: ButtonStyle {
         configuration.label
             .font(.subheadline.weight(.semibold))
             .frame(width: 34, height: 34)
-            .foregroundStyle(on ? Brand.ink : .secondary)
+            .foregroundStyle(on ? Brand.onSage : .secondary)
             .background(Circle().fill(on ? Brand.sage : .clear))
             .overlay(Circle().strokeBorder(on ? Brand.sage : Color.secondary.opacity(0.4), lineWidth: 1.5))
             .scaleEffect(configuration.isPressed ? 0.95 : 1)

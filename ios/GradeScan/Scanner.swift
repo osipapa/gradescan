@@ -39,6 +39,7 @@ struct Capture {
     var track = 0
     var corners: [CGPoint] = []   // where it was in the video frame (normalized), to find it again in the photo
     var videoAspect = 16.0 / 9
+    var picture: Data?            // the straightened sheet from the video frame, in case the photo fails
 }
 
 struct PhotoResult {
@@ -81,6 +82,8 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
         var lastSeen: TimeInterval
         var lastCode: Int?
         var lastNumber: Int?
+        var frames = 0   // frames it's been found in; it's outlined from the third, so one-frame flukes never show
+        var ignored = false   // already used for something else (an answer key): passed over until it leaves the view
         var center: CGPoint { CGPoint(x: corners.reduce(0) { $0 + $1.x } / 4, y: corners.reduce(0) { $0 + $1.y } / 4) }
     }
     private var tracks: [Track] = []
@@ -90,6 +93,11 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
     private var expected: String?   // during a rescan, the only test that may be captured
     private var zipgradeQuiz: Quiz?   // the test ZipGrade sheets are for (they carry no test code)
     private var held = false        // frames are ignored, e.g. while a card is open over the camera
+
+    /// Passes over the sheets in view until they leave it (the answer key just read, so it isn't scanned as a student's).
+    func ignoreInView() {
+        queue.async { for i in self.tracks.indices { self.tracks[i].ignored = true } }
+    }
 
     func setTests(_ list: [Quiz]) {
         let byCode = Dictionary(list.compactMap { q in q.sheetCode.map { ($0, q) } }, uniquingKeysWith: { first, _ in first })
@@ -231,11 +239,13 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
                               width: CVPixelBufferGetWidthOfPlane(pixels, 0),
                               height: CVPixelBufferGetHeightOfPlane(pixels, 0),
                               bytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(pixels, 0))
-        // A candidate of ours is a real sheet if its test code reads (or it sits where a sheet with a code was a moment
-        // ago and the code blurred for a frame). ZipGrade's six squares don't happen by chance.
+        // A candidate of ours is a real sheet if the code of one of the teacher's tests reads on it, or any code reads
+        // crisply (a test not on this phone yet), or it sits where a sheet with a code was a moment ago and the code
+        // blurred for a frame. A ZipGrade candidate needs its printed bubbles where the form puts them.
         let accept: (FoundSheet) -> Bool = { sheet in
-            guard sheet.kind == .gradescan else { return true }
-            if let unit = Homography(BoxFinder.unitCorners, sheet.corners), Reader.testCode(image, unit) != nil { return true }
+            guard sheet.kind == .gradescan else { return ZipGrade.looksReal(image, corners: sheet.corners) }
+            if let unit = Homography(BoxFinder.unitCorners, sheet.corners), let code = Reader.testCode(image, unit),
+               self.tests[code] != nil || Reader.testCode(image, unit, strict: true) != nil { return true }
             let c = sheet.center
             return self.tracks.contains { $0.lastCode != nil && hypot($0.center.x - c.x, $0.center.y - c.y) < 0.03 }
         }
@@ -262,14 +272,20 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
 
         var infos: [SheetInView] = [], captures: [Capture] = []
         for (t, sheet) in matched {
+            if tracks[t].ignored {
+                tracks[t].corners = sheet.corners
+                tracks[t].lastSeen = time
+                continue
+            }
             let (info, capture) = follow(t, sheet, image, time)
-            infos.append(info)
+            tracks[t].frames += 1
+            if tracks[t].frames >= 3 || capture != nil { infos.append(info) }
             if var capture {
                 capture.videoAspect = Double(image.width) / Double(image.height)
                 captures.append(capture)
             }
         }
-        tracks.removeAll { time - $0.lastSeen > 1.5 }
+        tracks.removeAll { time - $0.lastSeen > ($0.ignored ? 0.4 : 1.5) }
         onEvent?(.frame(FrameInfo(sheets: infos)))
         if !captures.isEmpty {
             for capture in captures { onEvent?(.captured(capture)) }
@@ -331,6 +347,7 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
         capture.dateBox = layout.dateBox.flatMap { Reader.strip($0, image, map) }
         capture.track = track.id
         capture.corners = corners
+        capture.picture = Reader.sheetJPEG(layout, [], image, map, pixelsPerInch: 110)
         return (info, capture)
     }
 
@@ -367,9 +384,10 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
         let image = LumaImage(base: base.assumingMemoryBound(to: UInt8.self),
                               width: CVPixelBufferGetWidthOfPlane(pixels, 0), height: CVPixelBufferGetHeightOfPlane(pixels, 0),
                               bytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(pixels, 0))
+        let codes = Set(captures.compactMap(\.quiz.sheetCode))
         let found = photoFinder.findAll(image, limit: 8, accept: { sheet in
-            guard sheet.kind == .gradescan else { return true }
-            return Homography(BoxFinder.unitCorners, sheet.corners).flatMap { Reader.testCode(image, $0) } != nil
+            guard sheet.kind == .gradescan else { return ZipGrade.looksReal(image, corners: sheet.corners) }
+            return Homography(BoxFinder.unitCorners, sheet.corners).flatMap { Reader.testCode(image, $0) }.map(codes.contains) == true
         })
         let photoAspect = Double(image.width) / Double(image.height)
         return captures.map { capture in

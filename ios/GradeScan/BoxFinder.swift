@@ -19,7 +19,11 @@ final class BoxFinder {
         let y: Double
         let side: Double   // square root of the area
         let shape: Double  // area over the squared distance to the farthest pixel: about 1.8 for a square, 2.4+ for a filled bubble
+        let fill: Double   // share of its tightest box it fills, at any angle: about 0.95 for a square, at most 0.79 for a round bubble
     }
+
+    /// Directions every 7.5°, for measuring a blob's tightest box whatever its angle.
+    private static let directions: [(c: Double, s: Double)] = (0..<24).map { k in (cos(Double(k) * .pi / 24), sin(Double(k) * .pi / 24)) }
 
     private var factor = 3   // about 640 pixels across after downscaling, whatever the camera gives
     private let window = 61   // local-average window in downscaled pixels, a few times the largest square
@@ -46,14 +50,19 @@ final class BoxFinder {
         guard blobs.count >= 5 else { return [] }
         let f = Double(factor), w = Double(image.width), h = Double(image.height)
         var used = Set<Int>(), out: [FoundSheet] = []
-        for fit in fits(blobs, preferMiddle: preferMiddle) where out.count < limit {
-            let parts = fit.corners + fit.markers
-            guard parts.allSatisfy({ !used.contains($0) }) else { continue }
-            let sheet = FoundSheet(corners: fit.corners.map { CGPoint(x: (f * blobs[$0].x + f / 2) / w, y: (f * blobs[$0].y + f / 2) / h) },
-                                   kind: fit.kind)
-            guard accept(sheet) else { continue }
-            used.formUnion(parts)
-            out.append(sheet)
+        // Clearly square shapes first: sharp corner squares, without filled bubbles crowding them out. Then small or
+        // blurred ones, which look rounder.
+        var tried = Set<[Int]>()
+        for minFill in [0.9, 0.8] where out.count < limit {
+            for fit in fits(blobs, preferMiddle: preferMiddle, minFill: minFill) where out.count < limit {
+                let parts = fit.corners + fit.markers
+                guard !parts.contains(where: used.contains), tried.insert(parts).inserted else { continue }
+                let sheet = FoundSheet(corners: fit.corners.map { CGPoint(x: (f * blobs[$0].x + f / 2) / w, y: (f * blobs[$0].y + f / 2) / h) },
+                                       kind: fit.kind)
+                guard accept(sheet) else { continue }
+                used.formUnion(parts)
+                out.append(sheet)
+            }
         }
         return out
     }
@@ -119,16 +128,24 @@ final class BoxFinder {
                         // Area over the squared distance to the farthest pixel: about 2 for a square, 3.1 for a filled bubble.
                         let cx = Double(sumX) / Double(area), cy = Double(sumY) / Double(area)
                         var reach2 = 0.0
+                        var lo = [Double](repeating: .infinity, count: 24), hi = [Double](repeating: -.infinity, count: 24)
                         for y in minY...maxY {
                             for x in minX...maxX where label[y * w + x] == next {
                                 let dx = Double(x) - cx, dy = Double(y) - cy
                                 reach2 = max(reach2, dx * dx + dy * dy)
+                                for k in 0..<24 {
+                                    let p = dx * Self.directions[k].c + dy * Self.directions[k].s
+                                    lo[k] = min(lo[k], p)
+                                    hi[k] = max(hi[k], p)
+                                }
                             }
                         }
                         let reach = reach2.squareRoot() + 0.5
                         let shape = Double(area) / (reach * reach)
-                        guard shape > 1.5, shape < 2.6 else { continue }
-                        blobs.append(Blob(x: cx, y: cy, side: Double(area).squareRoot(), shape: shape))
+                        guard shape > 1.4, shape < 2.9 else { continue }
+                        // The tightest box: a direction and the one 90° from it (twelve steps of 7.5°).
+                        let box = (0..<12).map { k in (hi[k] - lo[k] + 1) * (hi[k + 12] - lo[k + 12] + 1) }.min() ?? Double(bw * bh)
+                        blobs.append(Blob(x: cx, y: cy, side: Double(area).squareRoot(), shape: shape, fill: Double(area) / box))
                     }
                 }
             }
@@ -145,9 +162,9 @@ final class BoxFinder {
 
     /// Every way four squares make a sheet whose extra squares are where its kind puts them, best first.
     /// Each square is only tried with its nearest similar-sized neighbors, so many sheets in view stay fast.
-    private func fits(_ blobs: [Blob], preferMiddle: Bool) -> [Fit] {
+    private func fits(_ blobs: [Blob], preferMiddle: Bool, minFill: Double) -> [Fit] {
         // Corner and edge squares are square; filled bubbles, which can be the same size, are round.
-        let square: (Int) -> Bool = { blobs[$0].shape < 2.45 }
+        let square: (Int) -> Bool = { blobs[$0].fill >= minFill }
         let cands = Array(blobs.indices.filter(square).sorted { blobs[$0].side > blobs[$1].side }.prefix(40))
         let sheet = Self.unitCorners
         let middle = CGPoint(x: Double(width) / 2, y: Double(height) / 2), diagonal = hypot(Double(width), Double(height))

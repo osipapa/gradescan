@@ -37,16 +37,21 @@ final class ScanSession: ObservableObject {
     @Published private(set) var cameraDenied = false
     @Published private(set) var note: String?
     @Published private(set) var torch = false
-    /// The test ZipGrade sheets are for (they carry no test code). Remembered until the teacher changes it.
+    /// The test this batch's ZipGrade sheets are for (they carry no test code). The teacher is asked for every batch:
+    /// it's forgotten when the batch is finished or thrown away, and never saved.
     @Published var zipgradeQuizId: String? {
-        didSet {
-            UserDefaults.standard.set(zipgradeQuizId, forKey: "zipgradeQuiz")
-            scanner.setZipGrade(zipgradeQuizId.flatMap(quiz))
-        }
+        didSet { scanner.setZipGrade(zipgradeQuizId.flatMap(quiz)) }
     }
-    @Published var askZipGrade = false            // a ZipGrade sheet is in view and no test is chosen yet
+    @Published var askZipGrade = false                        // the ZipGrade test list is open
     @Published private(set) var zipgradeInView = false
-    private var zipgradeQuietUntil = Date.distantPast
+    @Published private(set) var zipgradeNeedsTest = false     // a ZipGrade sheet is in view and this batch has no test yet
+    private var zipgradeLastNeeded = Date.distantPast
+    /// Reading an answer key: a sheet with every answer right, to set up a new test from.
+    @Published private(set) var capturingKey = false
+    @Published var keyDraft: KeyDraft?                        // the key just read, for the new test form
+    private var keyCaptureId: String?
+    private var keyAnswers: String?
+    private var fallbackPictures: [String: Data] = [:]      // video-frame sheet pictures, in case the photo fails
 
     let scanner = Scanner()
     let preview = PreviewView()
@@ -70,7 +75,7 @@ final class ScanSession: ObservableObject {
     init(store: AppStore) {
         self.store = store
         mode = Mode(rawValue: UserDefaults.standard.string(forKey: "scanMode") ?? "") ?? .batch
-        zipgradeQuizId = UserDefaults.standard.string(forKey: "zipgradeQuiz")
+        UserDefaults.standard.removeObject(forKey: "zipgradeQuiz")   // earlier versions remembered it
         preview.previewLayer.session = scanner.session
         scanner.configure(single: mode == .single, expect: nil)
         scanner.onEvent = { [weak self] event in
@@ -104,6 +109,7 @@ final class ScanSession: ObservableObject {
 
     func disappear() {
         scanner.stop()
+        if items.isEmpty && rescanning == nil { zipgradeQuizId = nil }   // no batch going: the next scan asks again
     }
 
     func toggleTorch() {
@@ -125,10 +131,52 @@ final class ScanSession: ObservableObject {
     func item(_ id: String) -> ScanItem? { items.first { $0.id == id } ?? (single?.id == id ? single : nil) }
     func quiz(_ id: String) -> Quiz? { store.tests.first { $0.id == id } }
 
-    /// The teacher closed the ZipGrade test picker without choosing: don't ask again for a few seconds.
-    func zipgradeAskDismissed() {
+    // MARK: Answer key
+
+    /// The stand-in test an answer key sheet is read against: all of ZipGrade's 20 rows, A–E.
+    static let keyQuiz = Quiz(id: "answer-key", title: "Answer key", numQuestions: 20, numChoices: 5, answerKey: String(repeating: "*", count: 20),
+                              pointsPerQuestion: 1, bonusCount: 0, layout: nil, code: nil)
+
+    /// Reads the next ZipGrade sheet held up as the answer key for a new test.
+    func startKeyCapture() {
         askZipGrade = false
-        zipgradeQuietUntil = Date().addingTimeInterval(8)
+        capturingKey = true
+        keyCaptureId = nil
+        keyAnswers = nil
+        card = nil
+        scanner.configure(single: true, expect: nil)
+        scanner.setZipGrade(Self.keyQuiz)
+        scanner.reset()
+        setPill(Pill(text: "Hold up the answer key"))
+    }
+
+    func cancelKeyCapture() {
+        capturingKey = false
+        keyCaptureId = nil
+        restoreScanning()
+    }
+
+    /// The new test form closed: with the test made from the key, this batch's ZipGrade sheets go to it.
+    func keyTestDone(_ quiz: Quiz?) {
+        keyDraft = nil
+        capturingKey = false
+        keyCaptureId = nil
+        if let quiz { zipgradeQuizId = quiz.id }
+        scanner.ignoreInView()   // the key sheet itself isn't a student's
+        restoreScanning()
+    }
+
+    private func restoreScanning() {
+        scanner.configure(single: mode == .single, expect: nil)
+        scanner.setZipGrade(zipgradeQuizId.flatMap(quiz))
+        scanner.resume(rescan: false)
+    }
+
+    /// The key as read: a letter per question up to the last one answered; rows it couldn't read are left to fill in.
+    private func showKey(_ answers: String) {
+        let letters = answers.map { "ABCDE".contains($0) ? $0 : nil } as [Character?]
+        let count = (letters.lastIndex { $0 != nil } ?? 19) + 1
+        keyDraft = KeyDraft(key: Array(letters.prefix(count)), choices: letters.contains("E") ? 5 : 4)
     }
     func student(_ id: String?) -> Student? { id.flatMap { id in store.students.first { $0.id == id } } }
     func isBatch(_ id: String) -> Bool { items.contains { $0.id == id } }
@@ -168,7 +216,10 @@ final class ScanSession: ObservableObject {
         case .frame(let f):
             let zipgrade = f.sheets.contains { $0.zipgrade }
             if zipgradeInView != zipgrade { zipgradeInView = zipgrade }
-            if f.sheets.contains(where: \.needsTest), !askZipGrade, Date() > zipgradeQuietUntil { askZipGrade = true }
+            // Asked on the camera, not in a pop-up that opens by itself: the teacher taps to choose.
+            if f.sheets.contains(where: \.needsTest) { zipgradeLastNeeded = Date() }
+            let needs = !capturingKey && Date().timeIntervalSince(zipgradeLastNeeded) < 1.5
+            if zipgradeNeedsTest != needs { zipgradeNeedsTest = needs }
             preview.show(f.sheets.compactMap { sheet in
                 guard let map = sheet.map else { return nil }
                 let look: PreviewView.Look
@@ -196,14 +247,12 @@ final class ScanSession: ObservableObject {
     private func updatePill(_ f: FrameInfo) {
         if let shown = captureShown, Date().timeIntervalSince(shown.at) < 1.6 { return setPill(shown.pill) }
         if f.sheets.contains(where: \.unknownTest) { return setPill(Pill(text: "Not one of your tests", tone: .warn)) }
-        if f.sheets.contains(where: \.needsTest) { return setPill(Pill(text: "ZipGrade sheet: which test?", tone: .warn)) }
+
         if let q = f.sheets.first(where: \.wrongTest)?.quiz { return setPill(Pill(text: "This sheet is for \(q.title)", tone: .warn)) }
         let gates = f.sheets.map(\.gate)
         let several = f.sheets.count > 1 ? "\(f.sheets.count) sheets · " : ""
-        if gates.isEmpty {
-            return setPill(store.loaded && store.tests.isEmpty ? Pill(text: "No tests yet. Create one first.", tone: .warn)
-                                                               : Pill(text: rescanning == nil ? "Point at the sheets" : "Point at the sheet to rescan"))
-        }
+        if capturingKey { return setPill(Pill(text: gates.isEmpty ? "Hold up the answer key" : "Hold steady")) }
+        if gates.isEmpty { return setPill(Pill(text: rescanning == nil ? "Point at the sheets" : "Point at the sheet to rescan")) }
         if gates.contains(where: { if case .locking = $0 { return true } else { return false } }) { return setPill(Pill(text: several + "Hold steady")) }
         if gates.contains(.blank) { return setPill(Pill(text: several + "Nothing filled in", tone: .warn)) }
         if gates.allSatisfy({ $0 == .waiting || { if case .fire = $0 { return true } else { return false } }($0) }) {
@@ -215,12 +264,26 @@ final class ScanSession: ObservableObject {
     private func setPill(_ p: Pill) { if pill != p { pill = p } }
 
     private func captured(_ c: Capture) {
+        if c.quiz.id == Self.keyQuiz.id {
+            // The answer key: wait for the sharper photo's reading (or the video's, if the photo doesn't come).
+            keyCaptureId = c.id
+            keyAnswers = c.answers
+            preview.flash(c.track)
+            haptics.notificationOccurred(.success)
+            setPill(Pill(text: "Reading the answer key…"))
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+                guard let self, self.keyCaptureId == c.id, self.keyDraft == nil, let answers = self.keyAnswers else { return }
+                self.showKey(answers)
+            }
+            return
+        }
+        if let picture = c.picture { fallbackPictures[c.id] = picture }
         var item = ScanItem(id: c.id, quizId: c.quiz.id, answers: c.answers, period: c.period, scannedAt: c.scannedAt)
         if c.kind == .zipgrade20 {
             item.form = SheetKind.zipgrade20.rawValue
             if let box = c.periodBox { fallbackPeriods[c.id] = box }
-            if let box = c.dateBox { fallbackDates[c.id] = box }
         }
+        if let box = c.dateBox { fallbackDates[c.id] = box }   // ZipGrade sheets, and ours printed with a Date line
         if let number = c.number, let student = store.students.first(where: { $0.number == number }) {
             item.studentId = student.id
             item.studentName = student.name
@@ -242,6 +305,7 @@ final class ScanSession: ObservableObject {
             // A rescan takes the old scan's place in the batch.
             rescanning = nil
             scanner.configure(single: mode == .single, expect: nil)
+            scanner.setZipGrade(zipgradeQuizId.flatMap(quiz))
             scanner.resume(rescan: false)
             if let i = items.firstIndex(where: { $0.id == target }) {
                 let old = items[i]
@@ -269,6 +333,11 @@ final class ScanSession: ObservableObject {
     }
 
     private func photoArrived(_ p: PhotoResult) {
+        if p.id == keyCaptureId {
+            if keyDraft == nil { showKey(p.answers ?? keyAnswers ?? "") }
+            return
+        }
+        let picture = fallbackPictures.removeValue(forKey: p.id)
         guard var item = self.item(p.id) else { fallbackNames[p.id] = nil; return }
         if let answers = p.answers {
             item.answers = answers
@@ -277,7 +346,8 @@ final class ScanSession: ObservableObject {
             item.rows = Review.rows(item.answers, marks: [:], key: quiz.answerKey).rows   // video only: marks not known
         }
         if let period = p.period { item.period = period }
-        if let jpeg = p.jpeg { item.photo = Photos.save(jpeg, id: item.id) } else { item.photoFailed = true }
+        // Without a photo, the video frame's picture of the sheet: less sharp, but the teacher can check the marks.
+        if let jpeg = p.jpeg ?? picture { item.photo = Photos.save(jpeg, id: item.id) } else { item.photoFailed = true }
         update(item)
         let strip = p.name ?? fallbackNames[p.id]
         fallbackNames[p.id] = nil
@@ -540,6 +610,7 @@ final class ScanSession: ObservableObject {
         heldForCard = false
         scanner.hold(false)
         scanner.configure(single: true, expect: item.quizId)
+        if item.form == SheetKind.zipgrade20.rawValue { scanner.setZipGrade(quiz(item.quizId)) }   // it's already known
         scanner.reset()
         scanner.start()
     }
@@ -548,6 +619,7 @@ final class ScanSession: ObservableObject {
         guard let id = rescanning else { return }
         rescanning = nil
         scanner.configure(single: mode == .single, expect: nil)
+        scanner.setZipGrade(zipgradeQuizId.flatMap(quiz))
         scanner.resume(rescan: false)
         if rescanFromReview { openReview(at: id) }
     }
@@ -562,6 +634,7 @@ final class ScanSession: ObservableObject {
         for item in items { if item.rejected { drop(item) } else { release(item) } }
         items = []
         reviewId = nil
+        zipgradeQuizId = nil
         saveBatch()
     }
 
@@ -570,6 +643,18 @@ final class ScanSession: ObservableObject {
         for item in items { drop(item) }
         items = []
         reviewId = nil
+        zipgradeQuizId = nil
+        saveBatch()
+    }
+
+    // TESTING ONLY — remove before production, with the wipe in Settings.
+    /// Forgets the batch on this phone; the wipe deletes the server's copies itself.
+    func forgetBatch() {
+        for item in items { if let photo = item.photo { Photos.remove(photo) } }
+        items = []
+        reviewId = nil
+        card = nil
+        zipgradeQuizId = nil
         saveBatch()
     }
 
@@ -606,4 +691,11 @@ final class ScanSession: ObservableObject {
         guard words.count > 1, let initial = words.last?.first else { return name }
         return "\(words[0]) \(initial)."
     }
+}
+
+/// An answer key read from a sheet, for the new test form.
+struct KeyDraft: Identifiable {
+    let id = UUID()
+    let key: [Character?]
+    let choices: Int
 }

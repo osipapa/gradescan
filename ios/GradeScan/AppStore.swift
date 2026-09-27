@@ -5,13 +5,14 @@ import UIKit
 /// Account, tests, the class list, and the upload queue. Scanning itself lives in `ScanSession`.
 @MainActor
 final class AppStore: ObservableObject {
-    enum Tab: Hashable { case scan, tests }
+    enum Tab: Hashable { case scan, tests, students, settings }
 
     @Published var session: Session?
     @Published var tests: [Quiz] = []
     @Published var loaded = false
     @Published var students: [Student] = []   // the class list, for matching names; managed in the portal
     @Published var summaries: [String: TestSummary] = [:]   // by test id
+    @Published var studentSummaries: [String: TestSummary] = [:]   // by student id: tests scanned and average percent
     @Published var pending: [ScanUpload] = []
     @Published var problem: String?
     @Published var tab: Tab = .scan
@@ -51,10 +52,12 @@ final class AppStore: ObservableObject {
 
     func signOut() {
         session = nil
+        tab = .scan
         Keychain.set("session", nil)
         tests = []
         students = []
         summaries = [:]
+        studentSummaries = [:]
     }
 
     private func validToken() async throws -> String {
@@ -90,7 +93,7 @@ final class AppStore: ObservableObject {
         }
     }
 
-    /// Scanned count and average for each test, for the Tests list.
+    /// Scanned count and average for each test (the Tests list) and each student (the Students list).
     func loadSummaries() async {
         guard let token = try? await validToken(), let rows = try? await API.scanSummaries(token) else { return }
         var out: [String: TestSummary] = [:]
@@ -100,9 +103,18 @@ final class AppStore: ObservableObject {
             out[quizId] = TestSummary(count: stats.count, average: stats.average)
         }
         summaries = out
+        let byTest = Dictionary(tests.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        var perStudent: [String: TestSummary] = [:]
+        for (studentId, scans) in Dictionary(grouping: rows.filter { $0.studentId != nil }, by: { $0.studentId ?? "" }) {
+            let percents = scans.compactMap { row in byTest[row.quizId].flatMap { $0.percent(row.answers, override: row.scoreOverride) } }
+            perStudent[studentId] = TestSummary(count: percents.count,
+                                                average: percents.isEmpty ? nil : Double(percents.reduce(0, +)) / Double(percents.count))
+        }
+        studentSummaries = perStudent
     }
 
-    func createTest(title: String, questions: Int, choices: Int, key: String, points: Double, bonus: Int) async -> Bool {
+    /// Creates a test; returns it, or nil if it couldn't be saved.
+    func createTest(title: String, questions: Int, choices: Int, key: String, points: Double, bonus: Int) async -> Quiz? {
         do {
             let token = try await validToken()
             let used = Set(tests.compactMap(\.sheetCode))
@@ -110,10 +122,10 @@ final class AppStore: ObservableObject {
             let quiz = try await API.createTest(title: title, questions: questions, choices: choices, key: key,
                                                 points: points, bonus: bonus, code: code, token)
             tests.insert(quiz, at: 0)
-            return true
+            return quiz
         } catch {
             problem = error.localizedDescription
-            return false
+            return nil
         }
     }
 
@@ -122,6 +134,14 @@ final class AppStore: ObservableObject {
         let token = try await validToken()
         let server = try await API.scans(quiz.id, token)
         let local = pending.filter { $0.quizId == quiz.id && !server.map(\.id).contains($0.id) }.map(ScanRecord.init)
+        return local + server
+    }
+
+    /// A student's scans across tests, newest first.
+    func scans(forStudent id: String) async throws -> [ScanRecord] {
+        let token = try await validToken()
+        let server = try await API.scans(studentId: id, token)
+        let local = pending.filter { $0.studentId == id && !server.map(\.id).contains($0.id) }.map(ScanRecord.init)
         return local + server
     }
 
@@ -149,16 +169,86 @@ final class AppStore: ObservableObject {
 
     /// Adds students (skipping anyone already on the list for that period). Returns how many were added.
     func addStudents(_ list: [(name: String, period: Int?)]) async -> Int {
-        let known = Set(students.map { NameMatch.tokens($0.name).sorted().joined(separator: " ") + "|\($0.period ?? 0)" })
-        let new = list.filter { !known.contains(NameMatch.tokens($0.name).sorted().joined(separator: " ") + "|\($0.period ?? 0)") }
-        guard !new.isEmpty else { return 0 }
+        await importStudents(list)?.count ?? 0
+    }
+
+    /// Adds students, skipping anyone already on the list for that period. Returns those added, or nil if it failed.
+    func importStudents(_ list: [(name: String, period: Int?)]) async -> [Student]? {
+        let key: (String, Int?) -> String = { NameMatch.tokens($0).sorted().joined(separator: " ") + "|\($1 ?? 0)" }
+        let known = Set(students.map { key($0.name, $0.period) })
+        var seen = Set<String>()
+        let new = list.filter { !known.contains(key($0.name, $0.period)) && seen.insert(key($0.name, $0.period)).inserted }
+        guard !new.isEmpty else { return [] }
         do {
             let added = try await API.addStudents(new, try await validToken())
             students = (students + added).sorted { $0.name < $1.name }
-            return added.count
+            return added
         } catch {
             problem = error.localizedDescription
-            return 0
+            return nil
+        }
+    }
+
+    /// Takes back students just added (Undo after an import).
+    func removeStudents(_ list: [Student]) async -> Bool {
+        do {
+            try await API.deleteStudents(list.map(\.id), try await validToken())
+            let ids = Set(list.map(\.id))
+            students.removeAll { ids.contains($0.id) }
+            return true
+        } catch {
+            problem = "Couldn't undo: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    /// Saves a student's name and period. Returns whether it saved.
+    @discardableResult
+    func updateStudent(_ student: Student, name: String, period: Int?) async -> Bool {
+        let name = name.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return false }
+        do {
+            try await API.updateStudent(student.id, name: name, period: period, try await validToken())
+            if let i = students.firstIndex(where: { $0.id == student.id }) {
+                students[i] = Student(id: student.id, name: name, period: period, number: student.number)
+                students.sort { $0.name < $1.name }
+            }
+            return true
+        } catch {
+            problem = "Couldn't save: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    /// Takes a student off the class list. Their scans stay, without the student.
+    func removeStudent(_ student: Student) async {
+        do {
+            try await API.deleteStudent(student.id, try await validToken())
+            students.removeAll { $0.id == student.id }
+            studentSummaries[student.id] = nil
+        } catch {
+            problem = "Couldn't remove: \(error.localizedDescription)"
+        }
+    }
+
+    // TESTING ONLY — remove before production (with API.wipeEverything and the Testing section in SettingsView).
+    /// Deletes everything on this account: scans, students, tests and sheet photos, and anything waiting to upload.
+    func wipeEverything() async -> Bool {
+        do {
+            guard let user = session?.userId else { return false }
+            pending.forEach { if let file = $0.localPhoto { Photos.remove(file) } }
+            pending = []
+            savePending()
+            try await API.wipeEverything(userId: user, try await validToken())
+            tests = []
+            students = []
+            summaries = [:]
+            studentSummaries = [:]
+            conflicts = [:]
+            return true
+        } catch {
+            problem = "Couldn't delete everything: \(error.localizedDescription)"
+            return false
         }
     }
 

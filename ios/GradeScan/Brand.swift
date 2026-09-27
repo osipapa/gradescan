@@ -3,10 +3,12 @@ import UIKit
 
 /// GradeScan brand: Green Sage #98A869 on warm, olive-tinted neutrals (same tokens as the portal).
 enum Brand {
-    /// Fills: the main button, chosen bubbles, chart bars. Text on sage is `ink` in both modes.
-    static let sage = Color(light: 0x98A869, dark: 0xA9B97A)
+    /// Fills: the main button, chosen bubbles, chart bars. Light mode uses Fern #497825, a deep leaf green that reads on white.
+    static let sage = Color(light: 0x497825, dark: 0xA9B97A)
+    /// Text and icons on a sage fill: white on the deep light-mode green, ink on the light dark-mode sage.
+    static let onSage = Color(light: 0xFFFFFF, dark: 0x1C1F17)
     /// Sage for text and icons (the app's accent color): readable on white and on black.
-    static let sageStrong = Color(light: 0x5F6E3A, dark: 0xC3D19A)
+    static let sageStrong = Color(light: 0x497825, dark: 0xC3D19A)
     /// Deep sage for tinted glass over the camera, where the text is always white.
     static let moss = Color(hex: 0x5F6E3A)
     static let ink = Color(hex: 0x1C1F17)
@@ -17,9 +19,9 @@ enum Brand {
 }
 
 extension View {
-    /// The main action on a screen: sage with ink text in both modes, like the portal's primary button.
+    /// The main action on a screen: sage with `onSage` text, like the portal's primary button.
     func primaryButton() -> some View {
-        buttonStyle(.borderedProminent).tint(Brand.sage).foregroundStyle(Brand.ink)
+        buttonStyle(.borderedProminent).tint(Brand.sage).foregroundStyle(Brand.onSage)
     }
 }
 
