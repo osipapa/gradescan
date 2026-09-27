@@ -15,8 +15,23 @@ struct SheetLayout: Codable, Sendable {
     let questions: [[[Double]]]  // bubble centers per question, one per answer choice
     let period: [[Double]]       // bubble centers for periods 1–9
     let name: [Double]           // handwritten name area: x, y, width, height
+    var periodBox: [Double]? = nil   // a handwritten period box instead of bubbles (ZipGrade): x, y, width, height
 
     var cornerPoints: [CGPoint] { corners.map(Self.point) }
+
+    /// Rings just outside a bubble where strokes leaving it (an X over it) are looked for, in bubble radii: clear
+    /// of its own printed circle and of the neighboring bubbles, which sit closer together on some sheets.
+    var armsRadii: [Double] {
+        guard let row = questions.first, row.count > 1, r > 0 else { return [1.35, 1.5] }
+        let neighbor = hypot(row[1][0] - row[0][0], row[1][1] - row[0][1]) / r - 1   // where the next circle begins
+        return neighbor >= 1.7 ? [1.35, 1.5] : [1.1, max(1.12, min(1.35, neighbor - 0.1))]
+    }
+
+    /// How dark a stroke past the circle must be to count. Where printed grey circles sit close by (ZipGrade),
+    /// only pen and pencil dark enough to stand out from them count.
+    var armsContrast: Double {
+        armsRadii == [1.35, 1.5] ? Reader.inkContrast : 0.4
+    }
     var markerPoint: CGPoint { Self.point(marker) }
 
     func bubble(_ question: Int, _ choice: Int) -> CGPoint? {
@@ -216,29 +231,30 @@ enum Reader {
         static let empty = Bubble(coverage: 0, tone: 0, crossedOut: false, xMark: false, circled: false, arms: 0)
     }
 
-    static func inspect(_ c: CGPoint, radius r: Double, _ img: LumaImage, _ h: Homography) -> Bubble {
+    static func inspect(_ c: CGPoint, radius r: Double, _ img: LumaImage, _ h: Homography, arms armsRadii: [Double] = [1.35, 1.5],
+                        armsContrast: Double = inkContrast) -> Bubble {
         let luma: (Double, Double) -> Double? = { x, y in img.smooth(h.apply(CGPoint(x: c.x + r * x, y: c.y + r * y))) }
         let paper = ring.reduce(0.0) { max($0, luma($1.x, $1.y) ?? 0) }
         guard paper > 0 else { return .empty }
         let ink: (Double, Double) -> Double = { x, y in max(0, 1 - (luma(x, y) ?? paper) / paper) }
         let inside = disk.map { ink($0.x, $0.y) }.filter { $0 > inkContrast }
-        let around: ([Double]) -> [Bool] = { radii in
+        let around: ([Double], Double) -> [Bool] = { radii, contrast in
             (0..<spokes).map { k in
                 let a = Double(k) * 2 * .pi / Double(spokes)
-                return radii.contains { ink($0 * cos(a), $0 * sin(a)) > inkContrast }
+                return radii.contains { ink($0 * cos(a), $0 * sin(a)) > contrast }
             }
         }
         let coverage = Double(inside.count) / Double(disk.count)
         // Past the printed circle, far enough out that the circle itself doesn't show up when the sheet is a little
         // off. A fill that spills over leaves on one side; an X drawn over the bubble leaves in three or more
         // directions; a slash leaves on two opposite sides; a circle drawn around it is all around.
-        let outer = around([1.35, 1.5]), leaving = runs(outer).filter { $0.length <= 6 }   // strokes, not the printed circle
+        let outer = around(armsRadii, armsContrast), leaving = runs(outer).filter { $0.length <= 6 }   // strokes, not a printed circle
         let opposite = leaving.count == 2 && leaving.allSatisfy { $0.length <= 2 }
             && abs(angularDistance(leaving[0].center, leaving[1].center) - Double(spokes / 2)) <= 3
         // Inside: an X crosses a ring around the middle in three to five short strokes; a fill, scribble or loop
         // covers much more of it.
         let xMark = coverage <= 0.35 && [0.5, 0.65].contains { radius in
-            let circle = around([radius]), strokes = runs(circle)
+            let circle = around([radius], inkContrast), strokes = runs(circle)
             return share(circle) <= 0.4 && (3...5).contains(strokes.count) && strokes.allSatisfy { $0.length <= 8 }
         }
         return Bubble(coverage: coverage, tone: inside.isEmpty ? 0 : inside.reduce(0, +) / Double(inside.count),
@@ -342,16 +358,16 @@ enum Reader {
     /// Period (nil if not marked clearly) and one character per question: A–E, "-" blank, "*" rejected (more than one
     /// answer), "?" can't tell. With `align` (for the photo), bubbles are first nudged onto their printed circles.
     static func read(_ quiz: Quiz, _ layout: SheetLayout, _ img: LumaImage, _ h: Homography, align: Bool = false) -> (period: Int?, answers: String, marks: [Int: String]) {
-        let r = layout.r
+        let r = layout.r, arms = layout.armsRadii, armsContrast = layout.armsContrast
         let rows = [layout.period] + layout.questions.prefix(min(quiz.numQuestions, layout.questions.count)).map { Array($0.prefix(min(quiz.numChoices, 5))) }
         let fix = align ? correction(rows.flatMap { $0.map(SheetLayout.point) }, radius: r, img, h) : { _ in .zero }
         let bubbles: ([[Double]]) -> [Bubble] = { centers in
             centers.map(SheetLayout.point).map { c in
                 let d = fix(c)
-                return inspect(CGPoint(x: c.x + d.x, y: c.y + d.y), radius: r, img, h)
+                return inspect(CGPoint(x: c.x + d.x, y: c.y + d.y), radius: r, img, h, arms: arms, armsContrast: armsContrast)
             }
         }
-        let p = choose(bubbles(rows[0]))
+        let p = rows[0].isEmpty ? -1 : choose(bubbles(rows[0]))
         var answers = "", marks: [Int: String] = [:]
         for (q, row) in rows.dropFirst().enumerated() {
             let b = bubbles(row), k = choose(b)
@@ -424,9 +440,14 @@ enum Reader {
 
     /// The handwritten name, straightened and contrast-stretched so paper is white and ink is black.
     static func nameStrip(_ layout: SheetLayout, _ img: LumaImage, _ h: Homography, pixelsPerInch ppi: Double = 150) -> GrayStrip? {
-        guard layout.name.count == 4 else { return nil }
-        let x0 = layout.name[0], y0 = layout.name[1]
-        let width = Int(layout.name[2] * ppi), height = Int(layout.name[3] * ppi)
+        strip(layout.name, img, h, pixelsPerInch: ppi)
+    }
+
+    /// A handwritten box (the name, or ZipGrade's period), straightened and contrast-stretched.
+    static func strip(_ box: [Double], _ img: LumaImage, _ h: Homography, pixelsPerInch ppi: Double = 150) -> GrayStrip? {
+        guard box.count == 4 else { return nil }
+        let x0 = box[0], y0 = box[1]
+        let width = Int(box[2] * ppi), height = Int(box[3] * ppi)
         guard width > 0, height > 0 else { return nil }
         var values = [UInt8](repeating: 255, count: width * height)
         var histogram = [Int](repeating: 0, count: 256)

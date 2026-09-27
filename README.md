@@ -44,6 +44,12 @@ Scan paper tests with an iPhone, grade them automatically, and move the scores i
 7. If a student ends up with two scans for a test, nothing is replaced: both sheets show side by side with the differences outlined, and you keep one.
 8. Scores upload as soon as each sheet is read. The portal shows the same photos, marks and decisions, and you can settle rows there too.
 
+## ZipGrade sheets
+The phone also reads ZipGrade's standard 20-question form (the free one from zipgrade.com), printed at any size.
+- The first time a ZipGrade sheet is under the camera, pick which test it's for (or create one with its answer key). ZipGrade sheets go to that test until you change it: tap **ZipGrade · test name** above the status.
+- It reads the handwritten name and the handwritten period digit, and the bubbles with the same rules as ours.
+- ZipGrade's Test Version bubbles aren't used; every sheet is graded with the test's one answer key.
+
 ## How the phone reads marks
 It never guesses. Anything it can't call scores no credit and is highlighted on the sheet photo in review, where you tap the right answer or leave it.
 - **One mark in a row is the answer:** a fill, scribble, check, loop, or a lone X.

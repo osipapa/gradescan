@@ -11,8 +11,11 @@ enum ScanEvent {
 struct FrameInfo {
     let quiz: Quiz?           // the sheet's test (nil: no sheet, or a sheet of an unknown test)
     let map: Homography?      // sheet inches → image points; corner-to-corner units for an unknown test
+    var layout: SheetLayout?  // the sheet's layout, for the outline
     let unknownTest: Bool
     let wrongTest: Bool       // a known test, but not the one being rescanned
+    var zipgrade = false      // a ZipGrade form is in view
+    var needsTest = false     // …and the teacher hasn't said which test ZipGrade sheets are for
     let gate: GateOutput
 }
 
@@ -24,6 +27,8 @@ struct Capture {
     let answers: String
     let name: GrayStrip?      // the handwritten name from the video frame, in case the photo fails
     let scannedAt: Date
+    var kind: SheetKind = .gradescan
+    var periodBox: GrayStrip?   // ZipGrade: the handwritten period, from the video frame
 }
 
 struct PhotoResult {
@@ -31,8 +36,9 @@ struct PhotoResult {
     let answers: String?      // the photo's reading merged with the video's; nil if the photo couldn't be read
     let period: Int?
     let name: GrayStrip?
-    let jpeg: Data?           // the straightened sheet with the marks drawn on
+    let jpeg: Data?           // the straightened sheet (no marks; the apps draw them)
     var rows: [Int: RowReview] = [:]   // rows left for the teacher to check
+    var periodBox: GrayStrip?          // ZipGrade: the handwritten period, from the photo
 }
 
 /// Runs the camera, finds an answer sheet by its black squares, reads it, and captures it once when it's steady.
@@ -60,6 +66,7 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
     private var lastNumber: Int?
     private var gate = CaptureGate()
     private var expected: String?   // during a rescan, the only test that may be captured
+    private var zipgradeQuiz: Quiz?   // the test ZipGrade sheets are for (they carry no test code)
     private var held = false        // frames are ignored, e.g. while a card is open over the camera
 
     func setTests(_ list: [Quiz]) {
@@ -82,6 +89,9 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
     func resume(rescan: Bool) { queue.async { self.gate.resume(rescan: rescan) } }
 
     func hold(_ on: Bool) { queue.async { self.held = on } }
+
+    /// Which test ZipGrade sheets are for, as chosen by the teacher.
+    func setZipGrade(_ quiz: Quiz?) { queue.async { self.zipgradeQuiz = quiz } }
 
     /// iOS 27 can ask apps to scale back, for example in Low Power Mode. Scanning then runs at a lower frame rate.
     func setReducedResourceUsage(_ on: Bool) {
@@ -189,9 +199,14 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
                               height: CVPixelBufferGetHeightOfPlane(pixels, 0),
                               bytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(pixels, 0))
         let nothing = GateFrame(time: time, sheet: nil)
-        guard let corners = finder.find(image), let unit = Homography(BoxFinder.unitCorners, corners) else {
+        guard let found = finder.find(image), let unit = Homography(BoxFinder.unitCorners, found.corners) else {
             lastCorners = []
             emit(nil, nil, gate.step(nothing))
+            return
+        }
+        let corners = found.corners
+        if found.kind == .zipgrade20 {
+            readZipGrade(image, corners, unit, time)
             return
         }
         // The printed codes can blur for a frame; a sheet that hasn't moved keeps the codes it had.
@@ -225,15 +240,46 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
         emit(quiz, map, out)
     }
 
-    private func emit(_ quiz: Quiz?, _ map: Homography?, _ gate: GateOutput, unknown: Bool = false, wrong: Bool = false) {
-        onEvent?(.frame(FrameInfo(quiz: quiz, map: map, unknownTest: unknown, wrongTest: wrong, gate: gate)))
+    /// A ZipGrade form: no test code on it, so it's read as the test the teacher chose for ZipGrade sheets.
+    private func readZipGrade(_ image: LumaImage, _ corners: [CGPoint], _ unit: Homography, _ time: TimeInterval) {
+        let layout = ZipGrade.form20
+        guard let quiz = zipgradeQuiz, let map = Homography(layout.cornerPoints, corners) else {
+            var info = FrameInfo(quiz: nil, map: unit, unknownTest: false, wrongTest: false, gate: gate.step(GateFrame(time: time, sheet: nil)))
+            info.zipgrade = true
+            info.needsTest = true
+            onEvent?(.frame(info))
+            return
+        }
+        if let expected, quiz.id != expected {
+            emit(quiz, map, gate.step(GateFrame(time: time, sheet: nil)), wrong: true, layout: layout, zipgrade: true)
+            return
+        }
+        let read = Reader.read(quiz, layout, image, map)
+        let out = gate.step(GateFrame(time: time, sheet: SheetRead(corners: corners, identity: "\(quiz.id)|zipgrade",
+                                                                  period: nil, answers: read.answers)))
+        if case .fire(_, let answers) = out {
+            var capture = Capture(id: UUID().uuidString.lowercased(), quiz: quiz, number: nil, period: nil, answers: answers,
+                                  name: Reader.nameStrip(layout, image, map), scannedAt: Date())
+            capture.kind = .zipgrade20
+            capture.periodBox = layout.periodBox.flatMap { Reader.strip($0, image, map) }
+            onEvent?(.captured(capture))
+            takePhoto(capture)
+        }
+        emit(quiz, map, out, layout: layout, zipgrade: true)
+    }
+
+    private func emit(_ quiz: Quiz?, _ map: Homography?, _ gate: GateOutput, unknown: Bool = false, wrong: Bool = false,
+                      layout: SheetLayout? = nil, zipgrade: Bool = false) {
+        var info = FrameInfo(quiz: quiz, map: map, layout: layout ?? quiz?.layout, unknownTest: unknown, wrongTest: wrong, gate: gate)
+        info.zipgrade = zipgrade
+        onEvent?(.frame(info))
     }
 
     /// One full-resolution, silent (where iOS allows) photo of the captured sheet. It settles answers the video
     /// couldn't read, reads the handwritten name better, and is kept, marked, for the record.
     private func takePhoto(_ capture: Capture) {
         let failed = PhotoResult(id: capture.id, answers: nil, period: nil, name: nil, jpeg: nil)
-        guard session.isRunning, let layout = capture.quiz.layout,
+        guard session.isRunning, let layout = capture.kind.layout(for: capture.quiz),
               photoOutput.availablePhotoPixelFormatTypes.contains(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) else {
             onEvent?(.photo(failed))
             return
@@ -263,8 +309,9 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
                               width: CVPixelBufferGetWidthOfPlane(pixels, 0), height: CVPixelBufferGetHeightOfPlane(pixels, 0),
                               bytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(pixels, 0))
         let quiz = capture.quiz
-        guard let corners = photoFinder.find(image), let unit = Homography(BoxFinder.unitCorners, corners),
-              Reader.testCode(image, unit) == quiz.sheetCode, let map = Homography(layout.cornerPoints, corners) else { return nil }
+        guard let found = photoFinder.find(image), found.kind == capture.kind, let unit = Homography(BoxFinder.unitCorners, found.corners),
+              capture.kind == .zipgrade20 || Reader.testCode(image, unit) == quiz.sheetCode,
+              let map = Homography(layout.cornerPoints, found.corners) else { return nil }
         let read = Reader.read(quiz, layout, image, map, align: true)
         guard read.answers.count == capture.answers.count else { return nil }
         // The photo is sharper, so its reading wins. Rows it couldn't call are settled when no mark could be right.
@@ -273,7 +320,8 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
         return PhotoResult(id: capture.id, answers: review.answers, period: read.period,
                            name: Reader.nameStrip(layout, image, map, pixelsPerInch: 200),
                            jpeg: Reader.sheetJPEG(layout, [], image, map, pixelsPerInch: 150),
-                           rows: review.rows)
+                           rows: review.rows,
+                           periodBox: layout.periodBox.flatMap { Reader.strip($0, image, map, pixelsPerInch: 200) })
     }
 }
 

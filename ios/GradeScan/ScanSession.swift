@@ -37,11 +37,23 @@ final class ScanSession: ObservableObject {
     @Published private(set) var cameraDenied = false
     @Published private(set) var note: String?
     @Published private(set) var torch = false
+    /// The test ZipGrade sheets are for (they carry no test code). Remembered until the teacher changes it.
+    @Published var zipgradeQuizId: String? {
+        didSet {
+            UserDefaults.standard.set(zipgradeQuizId, forKey: "zipgradeQuiz")
+            scanner.setZipGrade(zipgradeQuizId.flatMap(quiz))
+        }
+    }
+    @Published var askZipGrade = false            // a ZipGrade sheet is in view and no test is chosen yet
+    @Published private(set) var zipgradeInView = false
+    private var zipgradeQuietUntil = Date.distantPast
 
     let scanner = Scanner()
     let preview = PreviewView()
     private let store: AppStore
     private var fallbackNames: [String: GrayStrip] = [:]   // video-frame names, in case the photo fails
+    private var fallbackPeriods: [String: GrayStrip] = [:] // ZipGrade: video-frame period boxes, in case the photo fails
+    private var periodStrips: [String: GrayStrip] = [:]    // ZipGrade: period boxes waiting to be read
     private var captureShown: (pill: Pill, at: Date, id: String)?
     private var rescanFromReview = false
     private var heldForCard = false
@@ -55,12 +67,17 @@ final class ScanSession: ObservableObject {
     init(store: AppStore) {
         self.store = store
         mode = Mode(rawValue: UserDefaults.standard.string(forKey: "scanMode") ?? "") ?? .batch
+        zipgradeQuizId = UserDefaults.standard.string(forKey: "zipgradeQuiz")
         preview.previewLayer.session = scanner.session
         scanner.configure(single: mode == .single, expect: nil)
         scanner.onEvent = { [weak self] event in
             Task { @MainActor [weak self] in self?.handle(event) }
         }
-        watch = store.$tests.sink { [weak self] tests in self?.scanner.setTests(tests) }
+        watch = store.$tests.sink { [weak self] tests in
+            guard let self else { return }
+            self.scanner.setTests(tests)
+            self.scanner.setZipGrade(self.zipgradeQuizId.flatMap { id in tests.first { $0.id == id } })
+        }
         // A scan saved without its student because the student already had one: the teacher compares the two.
         conflictWatch = store.$conflicts.sink { [weak self] conflicts in
             guard let self else { return }
@@ -104,6 +121,12 @@ final class ScanSession: ObservableObject {
 
     func item(_ id: String) -> ScanItem? { items.first { $0.id == id } ?? (single?.id == id ? single : nil) }
     func quiz(_ id: String) -> Quiz? { store.tests.first { $0.id == id } }
+
+    /// The teacher closed the ZipGrade test picker without choosing: don't ask again for a few seconds.
+    func zipgradeAskDismissed() {
+        askZipGrade = false
+        zipgradeQuietUntil = Date().addingTimeInterval(8)
+    }
     func student(_ id: String?) -> Student? { id.flatMap { id in store.students.first { $0.id == id } } }
     func isBatch(_ id: String) -> Bool { items.contains { $0.id == id } }
     func position(_ id: String) -> Int? { items.firstIndex { $0.id == id }.map { $0 + 1 } }
@@ -131,7 +154,9 @@ final class ScanSession: ObservableObject {
             cameraDenied = true
             setPill(Pill(text: "Camera access is off", tone: .warn))
         case .frame(let f):
-            let quad = f.map.map { map in (f.quiz?.layout?.cornerPoints ?? BoxFinder.unitCorners).map { map.apply($0) } }
+            let quad = f.map.map { map in (f.layout?.cornerPoints ?? BoxFinder.unitCorners).map { map.apply($0) } }
+            if zipgradeInView != f.zipgrade { zipgradeInView = f.zipgrade }
+            if f.needsTest, !askZipGrade, Date() > zipgradeQuietUntil { askZipGrade = true }
             let look: PreviewView.Look
             switch f.gate {
             case .locking(let p): look = f.unknownTest || f.wrongTest ? .warn : .locking(p)
@@ -155,6 +180,7 @@ final class ScanSession: ObservableObject {
     private func updatePill(_ f: FrameInfo) {
         if let shown = captureShown, Date().timeIntervalSince(shown.at) < 1.6 { return setPill(shown.pill) }
         if f.unknownTest { return setPill(Pill(text: "Not one of your tests", tone: .warn)) }
+        if f.needsTest { return setPill(Pill(text: "ZipGrade sheet: which test?", tone: .warn)) }
         if f.wrongTest, let q = f.quiz { return setPill(Pill(text: "This sheet is for \(q.title)", tone: .warn)) }
         switch f.gate {
         case .idle:
@@ -170,6 +196,10 @@ final class ScanSession: ObservableObject {
 
     private func captured(_ c: Capture) {
         var item = ScanItem(id: c.id, quizId: c.quiz.id, answers: c.answers, period: c.period, scannedAt: c.scannedAt)
+        if c.kind == .zipgrade20 {
+            item.form = SheetKind.zipgrade20.rawValue
+            if let box = c.periodBox { fallbackPeriods[c.id] = box }
+        }
         if let number = c.number, let student = store.students.first(where: { $0.number == number }) {
             item.studentId = student.id
             item.studentName = student.name
@@ -224,6 +254,8 @@ final class ScanSession: ObservableObject {
         update(item)
         let strip = p.name ?? fallbackNames[p.id]
         fallbackNames[p.id] = nil
+        if let box = p.periodBox ?? fallbackPeriods[p.id] { periodStrips[p.id] = box }
+        fallbackPeriods[p.id] = nil
         Task { await finalize(p.id, strip) }
     }
 
@@ -231,7 +263,10 @@ final class ScanSession: ObservableObject {
     private func finalize(_ id: String, _ strip: GrayStrip?) async {
         var read: String?
         if let strip { read = await NameReader.read(strip) }
+        var writtenPeriod: Int?   // ZipGrade: the period is written in a box, not bubbled
+        if let box = periodStrips.removeValue(forKey: id) { writtenPeriod = await NameReader.readPeriod(box) }
         guard var item = self.item(id) else { return }
+        if item.period == nil { item.period = writtenPeriod }
         item.read = read
         item.nameImage = strip?.jpegDataURL()
         if item.studentId == nil {
@@ -359,6 +394,8 @@ final class ScanSession: ObservableObject {
 
     private func drop(_ item: ScanItem) {
         fallbackNames[item.id] = nil
+        fallbackPeriods[item.id] = nil
+        periodStrips[item.id] = nil
         if !item.processing { Task { await store.remove(item.id) } }
         if let photo = item.photo { Photos.remove(photo) }
     }

@@ -61,3 +61,6 @@ create policy "sheets: own folder delete" on storage.objects for delete to authe
 
 -- Rows the phone couldn't call, waiting for (or settled by) the teacher.
 alter table public.scans add column if not exists review jsonb;
+
+-- Which answer sheet a scan was read from: null = the test's own GradeScan sheet, 'zipgrade20' = ZipGrade's 20-question form.
+alter table public.scans add column if not exists form text;

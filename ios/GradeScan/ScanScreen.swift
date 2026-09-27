@@ -17,6 +17,14 @@ struct ScanScreen: View {
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
                 Spacer()
+                if scan.zipgradeInView, let id = scan.zipgradeQuizId, let quiz = scan.quiz(id) {
+                    Button { scan.askZipGrade = true } label: {
+                        Text("ZipGrade · \(quiz.title)").font(.footnote.weight(.medium)).lineLimit(1)
+                            .padding(.horizontal, 12).padding(.vertical, 6)
+                    }
+                    .foregroundStyle(.white)
+                    .glassCapsule()
+                }
                 pill
                 if let problem = store.problem {
                     Button { Task { await store.send() } } label: {
@@ -38,6 +46,9 @@ struct ScanScreen: View {
         }
         .sheet(item: $scan.card, onDismiss: scan.cardDismissed) { ref in
             ItemCardSheet(id: ref.id).environmentObject(store).environmentObject(scan)
+        }
+        .sheet(isPresented: $scan.askZipGrade, onDismiss: { if scan.askZipGrade == false && scan.zipgradeQuizId == nil { scan.zipgradeAskDismissed() } }) {
+            ZipGradeTestPicker().environmentObject(store).environmentObject(scan)
         }
         .fullScreenCover(isPresented: $scan.showReview, onDismiss: scan.reviewClosed) {
             ReviewScreen().environmentObject(store).environmentObject(scan)
@@ -191,5 +202,62 @@ enum Thumbs {
         let thumb = full.preparingThumbnail(of: size) ?? full
         cache.setObject(thumb, forKey: name as NSString)
         return thumb
+    }
+}
+
+/// ZipGrade sheets carry no test code, so the teacher says which test a ZipGrade stack is for.
+struct ZipGradeTestPicker: View {
+    @EnvironmentObject var store: AppStore
+    @EnvironmentObject var scan: ScanSession
+    @Environment(\.dismiss) private var dismiss
+    @State private var creating = false
+    @State private var before: Set<String> = []
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Text("ZipGrade sheets don't say which test they're for. Pick the one with the right answer key; ZipGrade sheets go to it until you change it.")
+                        .font(.subheadline).foregroundStyle(.secondary)
+                }
+                Section("Your tests") {
+                    let fitting = store.tests.filter(ZipGrade.fits)
+                    if fitting.isEmpty { Text("No tests with 20 questions or fewer yet.").foregroundStyle(.secondary) }
+                    ForEach(fitting) { test in
+                        Button {
+                            scan.zipgradeQuizId = test.id
+                            dismiss()
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(test.title).foregroundStyle(.primary)
+                                    Text(test.summary).font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if test.id == scan.zipgradeQuizId { Image(systemName: "checkmark").foregroundStyle(Brand.sageStrong) }
+                            }
+                        }
+                    }
+                }
+                Section {
+                    Button("New test") {
+                        before = Set(store.tests.map(\.id))
+                        creating = true
+                    }
+                }
+            }
+            .navigationTitle("ZipGrade sheets")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
+            .sheet(isPresented: $creating, onDismiss: {
+                // A test just created here is the one for this stack.
+                if let new = store.tests.first(where: { !before.contains($0.id) }), ZipGrade.fits(new) {
+                    scan.zipgradeQuizId = new.id
+                    dismiss()
+                }
+            }) {
+                NewTestView().environmentObject(store)
+            }
+        }
     }
 }

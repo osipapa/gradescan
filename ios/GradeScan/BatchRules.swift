@@ -18,11 +18,15 @@ struct ScanItem: Identifiable, Codable, Equatable {
     var suggestedId: String?   // the student the handwriting probably is, waiting for a one-tap yes
     var rows: [Int: RowReview] = [:]   // rows the teacher checks, by question index
     var duplicateOf: String?   // the student's other scan for this test (in the batch or saved): the teacher keeps one
+    var form: String?          // nil = the test's own sheet, "zipgrade20" = ZipGrade's 20-question form
 
     var upload: ScanUpload {
         ScanUpload(id: id, quizId: quizId, studentId: studentId, period: period, studentName: studentName,
-                   nameImage: nameImage, localPhoto: photo, answers: answers, scannedAt: scannedAt, review: Review.stored(rows))
+                   nameImage: nameImage, localPhoto: photo, answers: answers, scannedAt: scannedAt, review: Review.stored(rows), form: form)
     }
+
+    /// Where the photo's bubbles are: ZipGrade's form, or the test's own sheet.
+    func layout(_ quiz: Quiz?) -> SheetLayout? { form == SheetKind.zipgrade20.rawValue ? ZipGrade.form20 : quiz?.layout }
 
     /// Something to check: no student, no period, a row waiting for a yes or no, or no usable photo.
     var needsLook: Bool { studentId == nil || period == nil || rows.values.contains { $0.result == nil } || photoFailed || duplicateOf != nil }

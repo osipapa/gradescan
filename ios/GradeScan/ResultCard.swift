@@ -17,6 +17,7 @@ struct CardData {
     var suggestion: Student?          // who the handwriting probably is, to confirm with one tap
     var rows: [Int: RowReview] = [:]  // rows to check, and ones already settled (shown with Undo)
     var duplicate = false             // the student already has another scan for this test: compare and keep one
+    var layout: SheetLayout?          // the photo's sheet when it isn't the test's own (a ZipGrade form)
 }
 
 /// One scanned sheet: the photo with its ✓ and ✗, who it is and the score, and any rows waiting for the teacher.
@@ -56,7 +57,7 @@ struct ResultCard: View {
             if let image = localImage ?? remote {
                 Image(uiImage: image).resizable().scaledToFit()
                     .overlay {
-                        if let quiz = data.quiz, let layout = quiz.layout {
+                        if let quiz = data.quiz, let layout = data.layout ?? quiz.layout {
                             SheetMarks(quiz: quiz, layout: layout, answers: data.answers, rows: data.rows,
                                        clean: data.localPhoto != nil || data.photoPath?.hasSuffix(".clean.jpg") == true)
                             Highlights(boxes: Highlights.rows(data.rows.filter { $0.value.result == nil }.keys.sorted(), layout,
@@ -254,7 +255,7 @@ struct ItemCard: View {
         ResultCard(data: CardData(quiz: scan.quiz(item.quizId), answers: item.answers, period: item.period, studentId: item.studentId,
                                   studentName: item.studentName, read: item.read, nameImage: item.nameImage, localPhoto: item.photo,
                                   processing: item.processing, notes: scan.notes(item), suggestion: scan.student(item.suggestedId),
-                                  rows: item.rows, duplicate: item.duplicateOf != nil),
+                                  rows: item.rows, duplicate: item.duplicateOf != nil, layout: item.layout(scan.quiz(item.quizId))),
                    assign: { scan.assign(item.id, to: $0) },
                    setPeriod: { scan.setPeriod(item.id, $0) },
                    settle: { scan.settle(item.id, question: $0, answer: $1) },
@@ -339,16 +340,18 @@ struct ScanSide {
     let localPhoto: String?
     let photoPath: String?
     let rows: [Int: RowReview]
+    var form: String?
 }
 
 extension ScanSide {
     init(_ record: ScanRecord) {
         self.init(id: record.id, answers: record.answers, override: record.scoreOverride, scannedAt: record.scannedAt,
-                  localPhoto: nil, photoPath: record.photoPath, rows: Review.loaded(record.review))
+                  localPhoto: nil, photoPath: record.photoPath, rows: Review.loaded(record.review), form: record.form)
     }
 
     init(_ item: ScanItem) {
-        self.init(id: item.id, answers: item.answers, override: nil, scannedAt: item.scannedAt, localPhoto: item.photo, photoPath: nil, rows: item.rows)
+        self.init(id: item.id, answers: item.answers, override: nil, scannedAt: item.scannedAt, localPhoto: item.photo, photoPath: nil,
+                  rows: item.rows, form: item.form)
     }
 }
 
@@ -466,7 +469,7 @@ struct SidePhoto: View {
             if let image = side.localPhoto.flatMap({ UIImage(contentsOfFile: Photos.url($0).path) }) ?? remote {
                 Image(uiImage: image).resizable().scaledToFit()
                     .overlay {
-                        if let layout = quiz.layout {
+                        if let layout = side.form == SheetKind.zipgrade20.rawValue ? ZipGrade.form20 : quiz.layout {
                             SheetMarks(quiz: quiz, layout: layout, answers: side.answers, rows: side.rows,
                                        clean: side.localPhoto != nil || side.photoPath?.hasSuffix(".clean.jpg") == true)
                             Highlights(boxes: Highlights.rows(outline, layout, choices: quiz.numChoices), layout: layout)

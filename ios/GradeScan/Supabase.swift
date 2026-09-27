@@ -54,6 +54,7 @@ struct ScanUpload: Codable, Sendable, Identifiable {
     var answers: String
     let scannedAt: Date
     var review: [String: RowReview]?   // rows waiting for (or settled by) the teacher, by question index
+    var form: String?          // the sheet it was read from: nil = the test's own sheet, "zipgrade20" = ZipGrade's form
 }
 
 /// Fields the teacher can fix after a scan.
@@ -88,6 +89,10 @@ struct ScanRecord: Codable, Identifiable, Sendable, Equatable {
     let scannedAt: Date
     let photoPath: String?
     var review: [String: RowReview]?
+    var form: String?
+
+    /// Where the photo's bubbles are: ZipGrade's form, or the test's own sheet.
+    func layout(_ quiz: Quiz) -> SheetLayout? { form == SheetKind.zipgrade20.rawValue ? ZipGrade.form20 : quiz.layout }
 }
 
 extension ScanRecord {
@@ -95,7 +100,7 @@ extension ScanRecord {
     init(_ upload: ScanUpload) {
         self.init(id: upload.id, quizId: upload.quizId, period: upload.period, studentId: upload.studentId, studentName: upload.studentName,
                   nameImage: upload.nameImage, answers: upload.answers, scoreOverride: nil, scannedAt: upload.scannedAt, photoPath: upload.photoPath,
-                  review: upload.review)
+                  review: upload.review, form: upload.form)
     }
 }
 
@@ -184,7 +189,7 @@ enum API {
 
     /// A test's scans, newest first.
     static func scans(_ quizId: String, _ token: String) async throws -> [ScanRecord] {
-        let data = try await request("/rest/v1/scans?quiz_id=eq.\(quizId)&select=id,quiz_id,period,student_id,student_name,name_image,answers,score_override,scanned_at,photo_path,review&order=scanned_at.desc", token: token)
+        let data = try await request("/rest/v1/scans?quiz_id=eq.\(quizId)&select=id,quiz_id,period,student_id,student_name,name_image,answers,score_override,scanned_at,photo_path,review,form&order=scanned_at.desc", token: token)
         return try decoder.decode([ScanRecord].self, from: data)
     }
 
@@ -232,7 +237,7 @@ enum API {
     }
 
     static func scan(_ id: String, _ token: String) async throws -> ScanRecord? {
-        let data = try await request("/rest/v1/scans?id=eq.\(id)&select=id,quiz_id,period,student_id,student_name,name_image,answers,score_override,scanned_at,photo_path,review", token: token)
+        let data = try await request("/rest/v1/scans?id=eq.\(id)&select=id,quiz_id,period,student_id,student_name,name_image,answers,score_override,scanned_at,photo_path,review,form", token: token)
         return try decoder.decode([ScanRecord].self, from: data).first
     }
 

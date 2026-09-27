@@ -24,13 +24,14 @@ final class BoxFinder {
     static let unitCorners = [CGPoint(x: 0, y: 0), CGPoint(x: 1, y: 0), CGPoint(x: 1, y: 1), CGPoint(x: 0, y: 1)]
     static let unitMarker = CGPoint(x: 0, y: 0.35)
 
-    /// Centers of the corner squares in normalized image coordinates: top-left, top-right, bottom-right, bottom-left.
-    func find(_ image: LumaImage) -> [CGPoint]? {
+    /// Centers of the corner squares in normalized image coordinates (top-left, top-right, bottom-right, bottom-left),
+    /// and which kind of sheet they belong to (ours, or a ZipGrade form), told apart by where the extra squares are.
+    func find(_ image: LumaImage) -> (corners: [CGPoint], kind: SheetKind)? {
         guard downscale(image) else { return nil }
         let blobs = squares()
-        guard blobs.count >= 5, let corners = bestFit(blobs) else { return nil }
+        guard blobs.count >= 5, let fit = bestFit(blobs) else { return nil }
         let f = Double(factor), w = Double(image.width), h = Double(image.height)
-        return corners.map { CGPoint(x: (f * $0.x + f / 2) / w, y: (f * $0.y + f / 2) / h) }
+        return (fit.corners.map { CGPoint(x: (f * $0.x + f / 2) / w, y: (f * $0.y + f / 2) / h) }, fit.kind)
     }
 
     private func downscale(_ image: LumaImage) -> Bool {
@@ -113,11 +114,11 @@ final class BoxFinder {
 
     /// The four corner squares, in top-left, top-right, bottom-right, bottom-left order, whose fitted sheet
     /// puts the fifth square where the layout says. Prefers the sheet nearest the middle of the frame.
-    private func bestFit(_ blobs: [Blob]) -> [Blob]? {
+    private func bestFit(_ blobs: [Blob]) -> (corners: [Blob], kind: SheetKind)? {
         let cands = Array(blobs.sorted { $0.side > $1.side }.prefix(12)), n = cands.count
-        let sheet = Self.unitCorners, marker = Self.unitMarker
+        let sheet = Self.unitCorners
         let middle = CGPoint(x: Double(width) / 2, y: Double(height) / 2), diagonal = hypot(Double(width), Double(height))
-        var best: (score: Double, corners: [Blob])?
+        var best: (score: Double, corners: [Blob], kind: SheetKind)?
         for i in 0..<n { for j in i + 1 ..< n { for k in j + 1 ..< n { for l in k + 1 ..< n {
             let quad = [cands[i], cands[j], cands[k], cands[l]]
             let biggest = quad.map(\.side).max()!, smallest = quad.map(\.side).min()!
@@ -128,26 +129,35 @@ final class BoxFinder {
             for turn in 0..<4 {
                 let corners = (0..<4).map { ring[($0 + turn) % 4] }
                 guard let map = Homography(sheet, corners.map { CGPoint(x: $0.x, y: $0.y) }) else { continue }
-                // Every sheet is 3.3–3.9 inches between the corner squares' centers and the squares are 0.25 inches,
-                // so each square is about 7% of that width. Page text and bubbles don't line up like that.
-                let sized = zip(sheet, corners).allSatisfy { point, blob in
-                    let a = map.apply(CGPoint(x: point.x - 0.035, y: point.y)), b = map.apply(CGPoint(x: point.x + 0.035, y: point.y))
-                    let expected = hypot(b.x - a.x, b.y - a.y)
-                    return blob.side > 0.6 * expected && blob.side < 1.6 * expected
+                for kind in [SheetKind.gradescan, .zipgrade20] {
+                    // Each kind's squares are a set share of the width between the corner squares' centers
+                    // (ours 0.25 in over 3.3–3.9 in, ZipGrade's 0.17 in over 3.4 in). Page text and bubbles don't line up like that.
+                    let half = kind.squareHalf
+                    let sized = zip(sheet, corners).allSatisfy { point, blob in
+                        let a = map.apply(CGPoint(x: point.x - half, y: point.y)), b = map.apply(CGPoint(x: point.x + half, y: point.y))
+                        let expected = hypot(b.x - a.x, b.y - a.y)
+                        return blob.side > 0.6 * expected && blob.side < 1.6 * expected
+                    }
+                    guard sized else { continue }
+                    let expected = corners.reduce(0) { $0 + $1.side } / 4
+                    var total = 0.0, allFound = true
+                    for marker in kind.markers {
+                        let predicted = map.apply(marker)
+                        var miss = Double.infinity, found: Blob?
+                        for blob in blobs {
+                            let d = hypot(blob.x - predicted.x, blob.y - predicted.y)
+                            if d < miss { miss = d; found = blob }
+                        }
+                        guard let found, miss < 0.4 * expected, found.side > 0.55 * expected, found.side < 1.8 * expected else { allFound = false; break }
+                        total += miss
+                    }
+                    guard allFound else { continue }
+                    let score = total / Double(kind.markers.count) / expected + 0.3 * hypot(mx - middle.x, my - middle.y) / diagonal
+                    if score < best?.score ?? .infinity { best = (score, corners, kind) }
                 }
-                guard sized else { continue }
-                let predicted = map.apply(marker), expected = corners.reduce(0) { $0 + $1.side } / 4
-                var miss = Double.infinity, found: Blob?
-                for blob in blobs {
-                    let d = hypot(blob.x - predicted.x, blob.y - predicted.y)
-                    if d < miss { miss = d; found = blob }
-                }
-                guard let found, miss < 0.4 * expected, found.side > 0.55 * expected, found.side < 1.8 * expected else { continue }
-                let score = miss / expected + 0.3 * hypot(mx - middle.x, my - middle.y) / diagonal
-                if score < best?.score ?? .infinity { best = (score, corners) }
             }
         }}}}
-        return best?.corners
+        return best.map { ($0.corners, $0.kind) }
     }
 
     private func area(_ ring: [Blob]) -> Double {
