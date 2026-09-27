@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GradeScan</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
+<style>
+  :root { color-scheme: light dark; --line: #8884; --blue: #2563eb; --red: #dc2626; }
+  body { font: 15px/1.45 system-ui, sans-serif; margin: 0; background: Canvas; color: CanvasText; }
+  header { display: flex; gap: 10px; align-items: center; padding: 10px 20px; border-bottom: 1px solid var(--line); }
+  main { max-width: 1000px; margin: 0 auto; padding: 20px 16px; }
+  h2 { margin: 0 0 10px; font-size: 18px; }
+  .card { border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; margin-bottom: 18px; }
+  .narrow { max-width: 360px; margin: 60px auto; display: grid; gap: 10px; }
+  input, select, textarea, button { font: inherit; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--line); background: Field; color: FieldText; }
+  textarea { width: 100%; box-sizing: border-box; }
+  button { cursor: pointer; background: var(--blue); color: #fff; border: 0; }
+  button.ghost { background: transparent; color: inherit; border: 1px solid var(--line); }
+  button.danger { background: var(--red); }
+  button.small { padding: 3px 9px; font-size: 13px; }
+  table { border-collapse: collapse; width: 100%; }
+  td, th { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  td input { width: 64px; }
+  .muted { opacity: .7; } .err { color: var(--red); } .mono { font-family: ui-monospace, monospace; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; align-items: end; }
+  .grid label { display: grid; gap: 4px; } .wide { grid-column: 1 / -1; }
+</style>
+</head>
+<body>
+<header>
+  <b>GradeScan</b>
+  <span id="nav" hidden><button class="ghost small" id="goQuizzes">Quizzes</button> <button class="ghost small" id="goRoster">Roster</button></span>
+  <span style="flex:1"></span><span id="who" class="muted"></span><button id="out" class="ghost small" hidden>Sign out</button>
+</header>
+<main id="view"></main>
+<script>
+// ── Settings: paste from Supabase → Project Settings → API ─────────────────────
+const SUPABASE_URL = 'https://YOUR-PROJECT-REF.supabase.co';
+const SUPABASE_KEY = 'YOUR-PUBLISHABLE-OR-ANON-KEY';
+
+// Sheet geometry in inches. Must match SheetLayout in Sheet.swift exactly.
+const L = { qr: 0.7, anchors: { TL: [0.9, 0.9], TR: [7.6, 0.9], BL: [0.9, 10.1], BR: [7.6, 10.1] },
+  r: 0.1, idX: [1.1, 1.45, 1.8], top: 2.35, pitch: 0.3, colX: [2.9, 5.3], cp: 0.35, perCol: 25, max: 50 };
+
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+const $ = id => document.getElementById(id);
+const view = $('view');
+let user = null, cryptoKey = null, roster = [], quizzes = [], quiz = null, scans = [], poll = null, lastSig = '', jup = null;
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fmt = x => String(Math.round(Number(x) * 100) / 100);
+const words = s => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+const nameKey = s => words(s).filter(w => !/^\d+$/.test(w)).sort().join(' ');
+const byCode = (a, b) => a.code.localeCompare(b.code);
+const periodsOf = list => [...new Set(list.map(s => s.period))].sort((a, b) => a - b);
+const stopPoll = () => { clearInterval(poll); poll = null; };
+
+function chrome(unlocked) {
+  $('nav').hidden = !unlocked; $('out').hidden = !user; $('who').textContent = user?.email || '';
+}
+$('goQuizzes').onclick = () => showQuizzes();
+$('goRoster').onclick = () => showRoster();
+$('out').onclick = async () => { await sb.auth.signOut(); location.reload(); };
+
+function download(name, text, type) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type }));
+  a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+
+function printHtml(title, body) {
+  const w = window.open('', '_blank');
+  if (!w) return alert('Allow pop-ups for this page to print.');
+  w.document.write(`<!doctype html><html><head><title>${esc(title)}</title></head><body>${body}</body></html>`);
+  w.document.close();
+  setTimeout(() => { w.focus(); w.print(); }, 400);
+}
+
+// ── Encryption: names are encrypted here, Supabase only stores ciphertext ─────
+async function deriveKey(passphrase, salt) {
+  const te = new TextEncoder();
+  const base = await crypto.subtle.importKey('raw', te.encode(passphrase), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt: te.encode('gradescan:' + salt), iterations: 310000, hash: 'SHA-256' },
+    base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+async function encrypt(text) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cryptoKey, new TextEncoder().encode(text)));
+  const out = new Uint8Array(12 + ct.length); out.set(iv); out.set(ct, 12);
+  return btoa(String.fromCharCode(...out));
+}
+async function decrypt(b64) {
+  const raw = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  return new TextDecoder().decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: raw.slice(0, 12) }, cryptoKey, raw.slice(12)));
+}
+
+// ── Grading (same rules as the phone) ─────────────────────────────────────────
+function grade(q, answers) {
+  const key = q.answer_key.toUpperCase(), missed = [];
+  let correct = 0;
+  for (let i = 0; i < q.num_questions; i++) {
+    const k = key[i], a = (answers || '')[i] || '-';
+    if (k === '*' || a === k) correct++; else missed.push(i + 1);
+  }
+  const pts = Number(q.points_per_question);
+  return { score: correct * pts, max: (q.num_questions - q.bonus_count) * pts, missed };
+}
+function keyProblem(key, n, choices, bonus) {
+  if (key.length !== n) return `The key has ${key.length} answers but the quiz has ${n} questions.`;
+  const allowed = 'ABCDE'.slice(0, choices);
+  if ([...key].some(ch => ch !== '*' && !allowed.includes(ch))) return `Use only ${allowed.split('').join(', ')} (or * to give everyone credit).`;
+  if (bonus >= n) return 'Bonus questions must be fewer than the total.';
+  return '';
+}
+const cleanKey = s => s.toUpperCase().replace(/[^A-E*]/g, '');
+
+// ── Sign in & unlock ──────────────────────────────────────────────────────────
+(async () => {
+  const { data } = await sb.auth.getSession();
+  user = data.session?.user || null;
+  user ? showUnlock() : showLogin();
+})();
+
+function showLogin(msg = '') {
+  chrome(false);
+  view.innerHTML = `<form id="f" class="card narrow"><h2>Sign in</h2>
+    <input id="em" type="email" placeholder="Email" autocomplete="username" required>
+    <input id="pw" type="password" placeholder="Password" autocomplete="current-password" required>
+    <button>Sign in</button><div class="err">${esc(msg)}</div></form>`;
+  $('f').onsubmit = async e => {
+    e.preventDefault();
+    const { data, error } = await sb.auth.signInWithPassword({ email: $('em').value, password: $('pw').value });
+    if (error) return showLogin(error.message);
+    user = data.user; showUnlock();
+  };
+}
+
+async function showUnlock(msg = '') {
+  chrome(false);
+  const { data, error } = await sb.from('students').select('id,period,code,name_enc');
+  if (error) return showLogin(error.message);
+  const first = data.length === 0;
+  view.innerHTML = `<form id="f" class="card narrow"><h2>${first ? 'Choose a roster passphrase' : 'Unlock roster'}</h2>
+    <p class="muted">${first
+      ? 'Student names are encrypted in this browser with this passphrase before they are saved. Write it down: without it the names can’t be recovered (you’d re-paste the roster).'
+      : 'Enter your roster passphrase.'}</p>
+    <input id="p1" type="password" placeholder="Passphrase" minlength="8" required>
+    ${first ? '<input id="p2" type="password" placeholder="Repeat passphrase" required>' : ''}
+    <button>Continue</button><div class="err">${esc(msg)}</div></form>`;
+  $('f').onsubmit = async e => {
+    e.preventDefault();
+    if (first && $('p1').value !== $('p2').value) return showUnlock('Passphrases don’t match.');
+    cryptoKey = await deriveKey($('p1').value, user.id);
+    try { roster = await Promise.all(data.map(async s => ({ ...s, name: await decrypt(s.name_enc) }))); }
+    catch { cryptoKey = null; return showUnlock('Wrong passphrase.'); }
+    showQuizzes();
+  };
+}
+
+// ── Roster ────────────────────────────────────────────────────────────────────
+function showRoster(msg = '') {
+  stopPoll(); chrome(true);
+  view.innerHTML = `<section class="card"><h2>Add students</h2>
+    <p class="muted">Paste names one per line, exactly as Jupiter shows them (e.g. “Last, First”). Each student gets a 3-digit Student # = period + number (e.g. 914). Names already on the roster keep their number.</p>
+    <div class="row"><label>Period <select id="per">${[1, 2, 3, 4, 5, 6, 7, 8, 9].map(p => `<option>${p}</option>`).join('')}</select></label></div>
+    <p><textarea id="names" rows="8" placeholder="Last, First"></textarea></p>
+    <div class="row"><button id="add">Add to roster</button><span class="muted">${esc(msg)}</span></div></section>
+    <section class="card"><div class="row"><h2 style="flex:1">Roster</h2><button id="codes" class="ghost small">Print Student # list</button></div>
+    ${periodsOf(roster).map(p => `<h3>Period ${p}</h3><table>${roster.filter(s => s.period === p).sort(byCode).map(s =>
+      `<tr><td class="mono" style="width:60px">${s.code}</td><td>${esc(s.name)}</td><td style="width:90px"><button class="danger small" data-del="${s.id}">Remove</button></td></tr>`).join('')}</table>`).join('')
+      || '<p class="muted">No students yet.</p>'}</section>`;
+  $('add').onclick = addStudents;
+  $('codes').onclick = () => printHtml('Student numbers',
+    '<style>body{font:13px system-ui;margin:.5in}table{border-collapse:collapse;margin:0 0 18px}td{border:1px solid #bbb;padding:3px 10px}</style>' +
+    periodsOf(roster).map(p => `<h3>Period ${p}</h3><table>${roster.filter(s => s.period === p).sort(byCode)
+      .map(s => `<tr><td>${s.code}</td><td>${esc(s.name)}</td></tr>`).join('')}</table>`).join(''));
+  view.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
+    if (!confirm('Remove this student from the roster?')) return;
+    const { error } = await sb.from('students').delete().eq('id', b.dataset.del);
+    if (error) return showRoster(error.message);
+    roster = roster.filter(s => s.id !== b.dataset.del); showRoster();
+  });
+}
+
+async function addStudents() {
+  const p = Number($('per').value);
+  const known = new Set(roster.map(s => nameKey(s.name)));
+  const pasted = new Map($('names').value.split(/\r?\n/).map(s => s.trim()).filter(Boolean).map(s => [nameKey(s), s]));
+  const fresh = [...pasted].filter(([k]) => k && !known.has(k)).map(([, s]) => s).sort((a, b) => a.localeCompare(b));
+  if (!fresh.length) return showRoster('Nothing new to add.');
+  let n = Math.max(0, ...roster.filter(s => s.period === p).map(s => Number(s.code.slice(1))));
+  if (n + fresh.length > 99) return showRoster('A period can have at most 99 students.');
+  const rows = [], nameByCode = {};
+  for (const name of fresh) {
+    const code = `${p}${String(++n).padStart(2, '0')}`;
+    nameByCode[code] = name;
+    rows.push({ period: p, code, name_enc: await encrypt(name) });
+  }
+  const { data, error } = await sb.from('students').insert(rows).select('id,period,code,name_enc');
+  if (error) return showRoster(error.message);
+  roster.push(...data.map(s => ({ ...s, name: nameByCode[s.code] })));
+  showRoster(`Added ${data.length}.`);
+}
+
+// ── Quizzes ───────────────────────────────────────────────────────────────────
+async function showQuizzes() {
+  stopPoll(); chrome(true);
+  const { data, error } = await sb.from('quizzes').select('*').order('created_at', { ascending: false });
+  quizzes = data || [];
+  view.innerHTML = `<section class="card"><h2>New quiz</h2><form id="nq" class="grid">
+    <label>Title<input id="t" required placeholder="Same name as in Jupiter"></label>
+    <label>Questions<input id="n" type="number" min="1" max="${L.max}" value="20" required></label>
+    <label>Choices<select id="c"><option value="2">A–B</option><option value="3">A–C</option><option value="4" selected>A–D</option><option value="5">A–E</option></select></label>
+    <label>Points per question<input id="pts" type="number" min="0" step="0.25" value="1" required></label>
+    <label>Bonus (last N questions)<input id="bonus" type="number" min="0" value="0" required></label>
+    <label class="wide">Answer key<input id="k" class="mono" autocomplete="off" required placeholder="e.g. BADC CABD …   (* = everyone gets credit)"></label>
+    <div class="row wide"><button>Create quiz</button><span id="qerr" class="err">${esc(error?.message || '')}</span></div></form></section>
+    <section class="card"><h2>Quizzes</h2>${quizzes.length ? `<table>${quizzes.map(q => `<tr>
+      <td><b>${esc(q.title)}</b><div class="muted">${q.num_questions} questions · A–${'ABCDE'[q.num_choices - 1]} · code ${q.code}</div></td>
+      <td style="width:270px"><div class="row"><button class="small" data-res="${q.id}">Results</button><button class="ghost small" data-print="${q.id}">Print sheet</button><button class="danger small" data-delq="${q.id}">Delete</button></div></td></tr>`).join('')}</table>`
+      : '<p class="muted">No quizzes yet.</p>'}</section>`;
+  $('nq').onsubmit = createQuiz;
+  view.querySelectorAll('[data-res]').forEach(b => b.onclick = () => showResults(b.dataset.res));
+  view.querySelectorAll('[data-print]').forEach(b => b.onclick = () => printSheet(quizzes.find(q => q.id === b.dataset.print)));
+  view.querySelectorAll('[data-delq]').forEach(b => b.onclick = async () => {
+    if (!confirm('Delete this quiz and all of its scans?')) return;
+    await sb.from('quizzes').delete().eq('id', b.dataset.delq);
+    showQuizzes();
+  });
+}
+
+async function createQuiz(e) {
+  e.preventDefault();
+  const n = Number($('n').value), c = Number($('c').value), bonus = Number($('bonus').value), key = cleanKey($('k').value);
+  const bad = keyProblem(key, n, c, bonus);
+  if (bad) return void ($('qerr').textContent = bad);
+  const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  const code = Array.from(crypto.getRandomValues(new Uint8Array(6)), b => alphabet[b % alphabet.length]).join('');
+  const { error } = await sb.from('quizzes').insert({ code, title: $('t').value.trim(), num_questions: n, num_choices: c,
+    answer_key: key, points_per_question: Number($('pts').value), bonus_count: bonus });
+  if (error) return void ($('qerr').textContent = error.message);
+  showQuizzes();
+}
+
+// ── Printable answer sheet (photocopy-friendly: no per-student info) ──────────
+function qrSvg(text, x, y, size) {
+  const qr = qrcode(0, 'M'); qr.addData(text); qr.make();
+  const n = qr.getModuleCount(), m = size / n, e = (m + 0.002).toFixed(4);
+  let d = '';
+  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++)
+    if (qr.isDark(r, c)) d += `M${(x + c * m).toFixed(4)} ${(y + r * m).toFixed(4)}h${e}v${e}h-${e}z`;
+  return `<path d="${d}" fill="#000"/>`;
+}
+
+function sheetSvg(q) {
+  const t = (x, y, s, size, extra = '') => `<text x="${x}" y="${y}" font-size="${size}" ${extra}>${esc(s)}</text>`;
+  const bubble = (x, y) => `<circle cx="${x}" cy="${y}" r="${L.r}" fill="none" stroke="#000" stroke-width="0.011"/>`;
+  const n = q.num_questions, letters = 'ABCDE'.slice(0, q.num_choices);
+  let s = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8.5 11" font-family="Helvetica, Arial, sans-serif">';
+  for (const [corner, [x, y]] of Object.entries(L.anchors)) s += qrSvg(`GS|${q.code}|${corner}`, x - L.qr / 2, y - L.qr / 2, L.qr);
+  s += t(1.55, 0.8, q.title.length > 44 ? q.title.slice(0, 43) + '…' : q.title, 0.2, 'font-weight="bold"');
+  s += t(1.55, 1.2, 'Name ________________________________   Period ______', 0.15);
+  s += t(0.75, 1.66, 'Student #', 0.15, 'font-weight="bold"');
+  for (const x of L.idX) s += `<rect x="${(x - 0.14).toFixed(2)}" y="1.76" width="0.28" height="0.3" fill="none" stroke="#000" stroke-width="0.01"/>`;
+  for (let d = 0; d < 10; d++) {
+    const y = +(L.top + d * L.pitch).toFixed(3);
+    s += t(0.85, (y + 0.05).toFixed(3), d, 0.14, 'text-anchor="end"');
+    for (const x of L.idX) s += bubble(x, y);
+  }
+  for (let col = 0; col * L.perCol < n; col++)
+    [...letters].forEach((ch, j) => s += t((L.colX[col] + j * L.cp).toFixed(3), (L.top - 0.22).toFixed(3), ch, 0.14, 'font-weight="bold" text-anchor="middle"'));
+  for (let i = 0; i < n; i++) {
+    const x0 = L.colX[Math.floor(i / L.perCol)], y = +(L.top + (i % L.perCol) * L.pitch).toFixed(3);
+    s += t((x0 - 0.25).toFixed(3), (y + 0.05).toFixed(3), i + 1, 0.14, 'text-anchor="end"');
+    for (let j = 0; j < letters.length; j++) s += bubble((x0 + j * L.cp).toFixed(3), y);
+  }
+  const b = q.bonus_count, bonus = !b ? '' : b === 1 ? ` · Q${n} is bonus` : ` · Q${n - b + 1}–${n} are bonus`;
+  s += t(4.25, 10.62, `Fill each bubble completely${bonus} · ${q.code}`, 0.12, 'text-anchor="middle"');
+  return s + '</svg>';
+}
+
+function printSheet(q) {
+  printHtml(`${q.title} – answer sheet`,
+    `<style>@page{size:letter;margin:0}html,body{margin:0}svg{display:block;width:8.5in;height:11in}</style>${sheetSvg(q)}`);
+}
+
+// ── Results (refreshes every 4 s while open) ──────────────────────────────────
+async function showResults(id) {
+  stopPoll(); chrome(true);
+  quiz = quizzes.find(q => q.id === id); lastSig = ''; jup = null;
+  view.innerHTML = `<section class="card">
+    <div class="row"><h2 style="flex:1">${esc(quiz.title)}</h2>
+      <button class="ghost small" id="back">← Quizzes</button><button class="ghost small" id="ps">Print sheet</button><button class="ghost small" id="csv">Download CSV</button></div>
+    <div class="row"><label>Answer key <input id="key" class="mono" size="${quiz.num_questions + 6}" value="${esc(quiz.answer_key)}"></label>
+      <button class="small" id="savekey">Save key &amp; regrade</button><span id="keymsg" class="muted"></span></div>
+    <div id="stats" class="muted" style="margin:10px 0"></div><div id="results"></div></section>
+    <section class="card"><h2>Send to Jupiter</h2>
+    <ol class="muted">
+      <li>In Jupiter: <b>Setup › Import/Export › Export Assignments as Spreadsheet</b> — pick this assignment and all your classes.</li>
+      <li>Choose that file below (or open it in Excel, copy all the cells, and paste them in the box).</li>
+      <li>Download the filled file (or copy it), then in Jupiter: <b>Setup › Import/Export › Import Assignments from Spreadsheet</b>. Jupiter shows every change before saving.</li></ol>
+    <div class="row"><input type="file" id="jfile" accept=".csv,.txt,.tsv"><button class="small" id="jread">Fill scores</button></div>
+    <p><textarea id="jtext" rows="3" placeholder="…or paste the exported cells here"></textarea></p><div id="jout"></div></section>`;
+  $('back').onclick = () => showQuizzes();
+  $('ps').onclick = () => printSheet(quiz);
+  $('csv').onclick = downloadCsv;
+  $('savekey').onclick = saveKey;
+  $('jread').onclick = jupiterRead;
+  await refreshScans(true);
+  poll = setInterval(refreshScans, 4000);
+}
+
+async function refreshScans(force = false) {
+  const { data, error } = await sb.from('scans').select('id,student_code,answers,score_override,scanned_at').eq('quiz_id', quiz.id);
+  if (error) return void ($('stats').textContent = error.message);
+  const sig = JSON.stringify(data);
+  if (!force && (sig === lastSig || $('results').contains(document.activeElement))) return; // don't redraw while typing
+  lastSig = sig; scans = data; renderResults();
+}
+
+function resultRows() {
+  const students = new Map(roster.map(s => [s.code, s]));
+  return scans.map(sc => {
+    const st = students.get(sc.student_code), g = grade(quiz, sc.answers);
+    return { sc, st, g, final: sc.score_override ?? g.score };
+  }).sort((a, b) => (a.st?.period ?? 0) - (b.st?.period ?? 0) || (a.st?.name || '').localeCompare(b.st?.name || '')
+    || a.sc.student_code.localeCompare(b.sc.student_code));
+}
+
+function renderResults() {
+  const rows = resultRows(), max = grade(quiz, '').max;
+  const done = new Set(scans.map(s => s.student_code));
+  const missing = roster.filter(s => !done.has(s.code)).sort(byCode);
+  const unknown = rows.filter(r => !r.st).length;
+  const avg = rows.length ? rows.reduce((sum, r) => sum + Number(r.final), 0) / rows.length : 0;
+  $('stats').innerHTML = `${rows.length} scanned · average ${fmt(avg)} / ${fmt(max)}`
+    + (unknown ? ` · <span class="err">${unknown} unknown Student # — fix below</span>` : '')
+    + (missing.length ? `<details><summary>${missing.length} on the roster not scanned</summary>${missing.map(s => `${s.code} ${esc(s.name)}`).join('<br>')}</details>` : '');
+  $('results').innerHTML = rows.length ? `<table><tr><th>Per.</th><th>Student #</th><th>Name</th><th>Score</th><th>Missed</th><th>Override</th><th></th></tr>
+    ${rows.map(r => `<tr><td>${r.st?.period ?? ''}</td>
+      <td><input class="mono" data-code="${r.sc.id}" value="${esc(r.sc.student_code)}" maxlength="3" style="width:52px"></td>
+      <td>${r.st ? esc(r.st.name) : '<span class="err">Unknown #</span>'}</td>
+      <td><b>${fmt(r.final)}</b> <span class="muted">/ ${fmt(r.g.max)}${r.sc.score_override != null ? ' (override)' : ''}</span></td>
+      <td class="muted">${r.g.missed.join(', ') || '—'}</td>
+      <td><input type="number" step="0.25" data-ov="${r.sc.id}" value="${r.sc.score_override ?? ''}" placeholder="—"></td>
+      <td><button class="danger small" data-dels="${r.sc.id}" title="Delete scan">×</button></td></tr>`).join('')}</table>`
+    : '<p class="muted">No scans yet — they show up here a few seconds after scanning.</p>';
+  $('results').querySelectorAll('[data-ov]').forEach(i => i.onchange = () => updateScan(i.dataset.ov, { score_override: i.value === '' ? null : Number(i.value) }));
+  $('results').querySelectorAll('[data-code]').forEach(i => i.onchange = () => updateScan(i.dataset.code, { student_code: i.value.trim() }));
+  $('results').querySelectorAll('[data-dels]').forEach(b => b.onclick = async () => {
+    if (!confirm('Delete this scan?')) return;
+    await sb.from('scans').delete().eq('id', b.dataset.dels);
+    refreshScans(true);
+  });
+}
+
+async function updateScan(id, patch) {
+  const { error } = await sb.from('scans').update(patch).eq('id', id);
+  if (error) alert(/duplicate/i.test(error.message) ? 'That Student # is already scanned for this quiz.' : error.message);
+  refreshScans(true);
+}
+
+async function saveKey() {
+  const key = cleanKey($('key').value);
+  const bad = keyProblem(key, quiz.num_questions, quiz.num_choices, quiz.bonus_count);
+  if (bad) return void ($('keymsg').textContent = bad);
+  const { error } = await sb.from('quizzes').update({ answer_key: key }).eq('id', quiz.id);
+  if (error) return void ($('keymsg').textContent = error.message);
+  quiz.answer_key = key;
+  $('keymsg').textContent = 'Saved — scores updated. On the phone, tap ⋯ › Reload quizzes.';
+  refreshScans(true);
+}
+
+function downloadCsv() {
+  const lines = [['Period', 'Student #', 'Name', 'Score', 'Out of', 'Missed']];
+  for (const r of resultRows()) lines.push([r.st?.period ?? '', r.sc.student_code, r.st?.name ?? 'Unknown', fmt(r.final), fmt(r.g.max), r.g.missed.join(' ')]);
+  download(`${quiz.title.replace(/[^\w\- ]+/g, '').trim() || 'quiz'}.csv`, '\uFEFF' + toDelimited(lines, ','), 'text/csv');
+}
+
+// ── Jupiter: fill scores into Jupiter's own export, which is the only format it imports ──
+function parseDelimited(text, d) {
+  const rows = []; let row = [], cell = '', quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quoted) {
+      if (ch === '"' && text[i + 1] === '"') { cell += '"'; i++; }
+      else if (ch === '"') quoted = false;
+      else cell += ch;
+    } else if (ch === '"' && cell === '') quoted = true;
+    else if (ch === d) { row.push(cell); cell = ''; }
+    else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && text[i + 1] === '\n') i++;
+      row.push(cell); rows.push(row); row = []; cell = '';
+    } else cell += ch;
+  }
+  if (cell !== '' || row.length) { row.push(cell); rows.push(row); }
+  return rows;
+}
+
+function toDelimited(rows, d) {
+  return rows.map(r => r.map(v => {
+    const s = String(v ?? '');
+    return /["\r\n]/.test(s) || s.includes(d) ? `"${s.replace(/"/g, '""')}"` : s;
+  }).join(d)).join('\r\n');
+}
+
+function matchRow(row, keys, dup) {
+  const c = row.slice(0, 4);
+  for (let i = 0; i < c.length; i++) {
+    for (const cand of [c[i], i + 1 < c.length ? `${c[i]} ${c[i + 1]}` : null]) {
+      const k = cand == null ? '' : nameKey(cand);
+      if (k && keys.has(k) && !dup.has(k)) return keys.get(k);
+    }
+  }
+  return null;
+}
+
+function guessColumn(cols, title) {
+  const tw = new Set(words(title));
+  let best = null, bestScore = 0.34;
+  for (const c of cols) {
+    if (!c.label) continue;
+    let s = words(c.label).filter(w => tw.has(w)).length / Math.max(1, tw.size);
+    if (/comment/i.test(c.label)) s -= 1;
+    if (/score/i.test(c.label)) s += 0.1;
+    if (s > bestScore) { bestScore = s; best = c.j; }
+  }
+  return best;
+}
+
+async function jupiterRead() {
+  const file = $('jfile').files[0];
+  let text = file ? await file.text() : $('jtext').value;
+  const out = $('jout');
+  if (!text.trim()) return void (out.innerHTML = '<p class="err">Choose the exported file or paste its cells first.</p>');
+  const bom = text.startsWith('\uFEFF'); if (bom) text = text.slice(1);
+  const delim = text.split(/\r?\n/).slice(0, 20).some(l => l.includes('\t')) ? '\t' : ',';
+  const rows = parseDelimited(text, delim);
+  const keys = new Map(), dup = new Set();
+  for (const s of roster) { const k = nameKey(s.name); if (keys.has(k)) dup.add(k); keys.set(k, s); }
+  const hits = [];
+  rows.forEach((row, r) => { const st = matchRow(row, keys, dup); if (st) hits.push({ r, st }); });
+  if (!hits.length) return void (out.innerHTML = '<p class="err">None of your roster names were found in this file. Check that roster names match Jupiter’s.</p>');
+  const header = rows.slice(0, hits[0].r), width = Math.max(...rows.map(r => r.length));
+  const cols = Array.from({ length: width }, (_, j) => ({ j, label: header.map(h => (h[j] || '').trim()).filter(Boolean).join(' · ') }));
+  jup = { rows, delim, bom, hits, name: file ? file.name : (delim === '\t' ? 'jupiter-import.txt' : 'jupiter-import.csv') };
+  const guess = guessColumn(cols, quiz.title);
+  out.innerHTML = `<div class="row"><label>Score column <select id="jcol"><option value="">Choose…</option>${cols.map(c =>
+    `<option value="${c.j}" ${c.j === guess ? 'selected' : ''}>Column ${c.j + 1}${c.label ? ': ' + esc(c.label.slice(0, 80)) : ''}</option>`).join('')}</select></label></div><div id="jsum"></div>`;
+  $('jcol').onchange = jupiterSummary;
+  jupiterSummary();
+}
+
+function jupiterFill() {
+  if ($('jcol').value === '') return null;
+  const j = Number($('jcol').value), rows = resultRows();
+  const score = new Map(rows.map(r => [r.sc.student_code, r.final]));
+  const out = jup.rows.map(r => r.slice()), filled = [];
+  for (const { r, st } of jup.hits) {
+    if (!score.has(st.code)) continue;
+    while (out[r].length <= j) out[r].push('');
+    filled.push({ name: st.name, before: out[r][j], after: fmt(score.get(st.code)) });
+    out[r][j] = fmt(score.get(st.code));
+  }
+  const inFile = new Set(jup.hits.map(h => h.st.code));
+  return { out, filled, notInFile: rows.filter(r => r.st && !inFile.has(r.st.code)).map(r => r.st.name),
+    unknown: rows.filter(r => !r.st).map(r => r.sc.student_code) };
+}
+
+function jupiterSummary() {
+  const res = jupiterFill();
+  if (!res) return void ($('jsum').innerHTML = '<p class="muted">Pick the column that holds this assignment’s scores.</p>');
+  $('jsum').innerHTML = `<p><b>${res.filled.length}</b> scores filled · ${jup.hits.length} students in the file.
+    ${res.notInFile.length ? `<br><span class="err">Scanned but not in this file: ${res.notInFile.map(esc).join(', ')}</span>` : ''}
+    ${res.unknown.length ? `<br><span class="err">Unknown Student # (fix in the table above first): ${res.unknown.map(esc).join(', ')}</span>` : ''}</p>
+    <table><tr><th>Student</th><th>In file now</th><th>New</th></tr>${res.filled.slice(0, 5).map(f =>
+      `<tr><td>${esc(f.name)}</td><td>${esc(f.before) || '—'}</td><td><b>${esc(f.after)}</b></td></tr>`).join('')}</table>
+    <p class="muted">Preview of the first 5 rows.</p>
+    <div class="row"><button id="jdl">Download filled file</button><button class="ghost" id="jcp">Copy for Jupiter’s paste box</button><span id="jmsg" class="muted"></span></div>`;
+  $('jdl').onclick = () => download(jup.name.replace(/(\.\w+)?$/, m => '-filled' + (m || '.csv')),
+    (jup.bom ? '\uFEFF' : '') + toDelimited(jupiterFill().out, jup.delim), 'text/plain');
+  $('jcp').onclick = async () => {
+    await navigator.clipboard.writeText(toDelimited(jupiterFill().out, '\t'));
+    $('jmsg').textContent = 'Copied — paste it into Jupiter’s import box.';
+  };
+}
+</script>
+</body>
+</html>
