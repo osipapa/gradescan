@@ -15,8 +15,10 @@ Scan paper tests with an iPhone, grade them automatically, and move the scores i
 5. Go to Project Settings › API Keys and copy the Project URL and the publishable (or anon) key.
 
 ## 2. Portal (desktop)
+The portal is live at **https://osipapa.github.io/gradescan/**. Every push to `main` that changes `portal/` redeploys it (`.github/workflows/pages.yml`). Only accounts added in step 1.3 can sign in.
+
 1. At the top of the script in `portal/index.html`, paste the URL and key into `SUPABASE_URL` and `SUPABASE_KEY`.
-2. Open the file in Chrome and sign in.
+2. Open the portal (or the file in Chrome) and sign in.
 3. Click **New test**. Enter the name (same as in Jupiter), the number of questions (1–50), the answer choices, points per question, bonus questions, and the answer key.
 4. Print the answer sheets (a 20-question sheet fits 4 to a page; cut along the gaps). Or choose **Copy image** and paste the answer box into your own test document.
 
