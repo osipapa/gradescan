@@ -1,14 +1,15 @@
 # GradeScan
 
-Scan paper quizzes with an iPhone, grade them automatically, and move the scores into Jupiter. No ZipGrade.
+Scan paper tests with an iPhone, grade them automatically, and move the scores into Jupiter. No ZipGrade and no roster.
 
-- `supabase_setup.sql`: the database. Every row is locked to her account, and student names are encrypted in the browser before they're saved.
-- `portal/index.html`: desktop portal for the roster, quizzes and answer keys, printable answer sheets, live results, CSV export, and filling Jupiter's import file.
-- `ios/`: iPhone app (Xcode). It reads each sheet, draws a red X on wrong answers so she can cross them out, says the score, and uploads it.
+- `portal/index.html`: desktop portal. Create a test, print its answer sheet, see results by class, and send scores to Jupiter.
+- `ios/`: iPhone app (Xcode). Pick the test and hold the phone over a sheet. It reads the bubbles and the handwritten name, marks wrong answers with a red X, shows the score, and uploads it.
+- `supabase_setup.sql`: the database. Every row is locked to her account.
 
 ## 1. Supabase (once, ~10 min)
 1. Create a free project at supabase.com.
 2. Go to SQL Editor › New query, paste `supabase_setup.sql`, and click Run.
+   - Set up before the roster was removed? Run `supabase_upgrade_v2.sql` instead. It keeps existing tests and scans.
 3. Go to Authentication › Users › Add user, enter her email and password, and tick Auto confirm.
 4. Go to Authentication › Sign In / Providers and turn off "Allow new users to sign up".
 5. Go to Project Settings › API Keys and copy the Project URL and the publishable (or anon) key.
@@ -16,43 +17,73 @@ Scan paper quizzes with an iPhone, grade them automatically, and move the scores
 ## 2. Portal (desktop)
 1. At the top of the script in `portal/index.html`, paste the URL and key into `SUPABASE_URL` and `SUPABASE_KEY`.
 2. Open the file in Chrome and sign in.
-3. Choose a roster passphrase. It encrypts student names; write it down.
-4. Roster: pick a period, paste the names exactly as Jupiter shows them (one per line), and click Add. Each student gets a 3-digit Student # (period + number). Print the Student # list for the class.
-5. Quizzes: enter the title (same as in Jupiter), the number of questions (1–50), the choices (A–B through A–E), points per question, bonus, and the answer key. Click Create › Print sheet, then photocopy the sheet.
+3. Click **New test**. Enter the name (same as in Jupiter), the number of questions (1–50), the answer choices, points per question, bonus questions, and the answer key.
+4. Print the answer sheets (a 20-question sheet fits 4 to a page; cut along the gaps). Or choose **Copy image** and paste the answer box into your own test document.
 
 ## 3. iPhone app
-1. Open `ios/GradeScan.xcodeproj` in Xcode 16 or newer.
+1. Open `ios/GradeScan.xcodeproj` in Xcode 27 or newer.
 2. In `ios/GradeScan/Supabase.swift`, paste the same URL and key into `Config`.
 3. Go to Target GradeScan › Signing & Capabilities, set Team to your Apple ID, and change the Bundle Identifier to something unique (for example, `com.yourname.gradescan`).
 4. Plug in her iPhone, select it as the run destination, and press Run.
    - First time on the phone: turn on Developer Mode (Settings › Privacy & Security), then trust the developer (Settings › General › VPN & Device Management).
 5. With a free Apple ID, the app stops opening after 7 days. Plug the phone in and press Run again.
 
+## The answer sheet
+- **Named sheets (recommended):** on a test's page, **Print named sheets**. Each student gets a sheet with their name and period already on it, and the phone knows who it is without reading handwriting.
+- **Blank sheets:** students write their name and fill in their period; the phone reads the handwriting and matches it to your Students list.
+- The black squares let the phone find the box anywhere on a page. The small squares along the bottom say which test it is (and along the top, on named sheets, which student). Don't cover or cut them off.
+- **Copy image** pastes the answer box into your own test document.
+
 ## Grading a stack
-1. Sign in on the phone. Add the roster passphrase if you want names shown instead of numbers.
-2. Hold or mount the phone over a sheet so all four corner QR codes are in view. After a steady moment, the phone buzzes, says the score, and uploads it.
-3. A red X marks the student's wrong answer, which she crosses out on paper. A green ring marks the right answer.
-4. Put the next sheet on top. Results show up in the portal within a few seconds.
+1. Open the app on the **Scan** tab and choose **Batch** (a stack) or **Single** (one sheet) at the bottom.
+2. Hold the phone over a sheet. The outline fills in as it locks on; when it's steady it buzzes once and shows the score. A sheet is captured once: it won't capture again until that sheet is out of view or a different one is under the camera.
+3. **Batch:** put the next sheet down; the tray counts them. Tap **Done** to review one sheet at a time: **Approve**, **Rescan** (captures just that sheet again), or delete.
+4. **Single:** the result opens right away with **Rescan** or **Next sheet**.
+5. On each sheet photo the phone draws a ✓ or ✗ by every number, so you can copy them onto the paper. Rows it couldn't call are outlined with an amber dot; tap **Right** or **Wrong** and the mark on the photo updates. **Undo** takes it back.
+6. The name is matched to your class list even when the handwriting reads a little off ("roah Sim" is Noah Kim). A clear match is filled in; a likely one asks you to confirm with one tap.
+7. If a student ends up with two scans for a test, nothing is replaced: both sheets show side by side with the differences outlined, and you keep one.
+8. Scores upload as soon as each sheet is read. The portal shows the same photos, marks and decisions, and you can settle rows there too.
+
+## How the phone reads marks
+It never guesses. Anything it can't call scores no credit and is highlighted on the sheet photo in review, where you tap the right answer or leave it.
+- **One mark in a row is the answer:** a fill, scribble, check, loop, or a lone X.
+- **A bubble with an X or slash through it doesn't count** when another bubble in the row is marked. If the crossed-out bubble is the only mark, it's flagged.
+- **Erased pencil:** when one mark is much lighter than the other, the darker one is the answer. Similar darkness: rejected as two answers. In between: flagged.
+- **X's on two or more bubbles, or two real marks:** rejected (two answers).
+- **Faint marks, a circled bubble, or a lone crossed-out fill:** flagged.
+- **Small stray marks next to a real answer** are ignored.
+
+## Tests, students and insights
+- **Tests:** create them in the portal or on the phone (Tests tab, +).
+- **Students:** **Import from Jupiter** (the same export file you use for grades) so names match Jupiter exactly, or add and paste names yourself.
+- **Topics:** on a test's page, pick or type a topic and click question numbers to tag them.
+- **Insights:** the **Dashboard** shows topics by class period and the questions most students missed. A test's page lists each question's share right and the wrong answer most chose. Each student has a page with their scores and weakest topics.
 
 ## Into Jupiter
-In the portal, go to Results › Send to Jupiter:
+On the test page, go to **Export › Send to Jupiter**:
 1. In Jupiter, go to Setup › Import/Export › Export Assignments as Spreadsheet (this assignment, all classes).
-2. Drop that file into the portal. It fills in the scores. Click Download filled file.
+2. Drop that file into the portal. It matches the names it read to Jupiter's students; check any marked **Check** or **No match**. Click **Download filled file**.
 3. In Jupiter, go to Setup › Import/Export › Import Assignments from Spreadsheet, choose the file, review the changes, and save.
 
-To get a plain list of scores instead, click Download CSV.
+To get a plain list of scores instead, choose **Export › Download CSV**.
 
 ## Fixing things
-- **Wrong answer key:** edit it on the Results page and click Save key & regrade. On the phone, tap ⋯ › Reload quizzes.
-- **Unreadable Student #:** the scan is saved as `?XX`. Type the right number on the Results page.
+- **Wrong answer key:** edit it in the Answer key card on the test page and save. Scores update right away. On the phone, tap ⋯ › Reload tests.
+- **Wrong or unknown student:** pick the right one in the results table (portal) or under Scans (phone).
+- **No period marked:** set it in the Needs review tab.
 - **Changing a score:** type the new score in the Override column.
-- **Scanning a sheet again:** the new scan replaces that student's earlier scan.
-- **Erasures read as answers:** raise `fillThreshold` in `Sheet.swift` (default 0.3).
-- **Faint pencil marks missed:** lower `fillThreshold` in `Sheet.swift`.
-- **Changing the sheet layout:** it's defined in two places, `L` in `portal/index.html` and `SheetLayout` in `Sheet.swift`. Change both together.
+- **Same sheet scanned twice:** the phone saves a sheet once until it leaves the camera. If a duplicate appears, tap Undo or delete it in the portal.
+- **Erasures or stray marks read as answers:** raise `markLevel` in `Sheet.swift` (default 0.2, the share of a bubble's inside that must be ink).
+- **Light marks missed:** lower `markLevel` in `Sheet.swift`. X's, checks, slashes and circles inside a bubble count as marks, not only solid fills.
+- **Changing the sheet design:** edit `sheetLayout` and `sheetSvg` in `portal/index.html`. Each test saves its layout and the phone reads sheets from it, so tests you already printed keep working.
+
+## iOS 27
+- Liquid Glass controls on iOS 26 and later. The app still runs on iOS 17.
+- On cameras that support iOS 27 exposure signals, auto exposure is tuned for printed paper, classroom light flicker, and moving sheets.
+- Scanning drops to 15 frames a second while the phone is hot, the battery is strained, or iOS asks apps to use less power.
+- Debug builds are compiled with optimization because the sheet finder runs on every camera frame.
 
 ## Privacy
 - Row-level security means only her login can read the data.
-- Names are encrypted in the browser with her passphrase (AES-GCM), so Supabase stores only ciphertext.
-- The phone keeps the derived key in the Keychain.
+- Student names, a small picture of each handwritten name, and a marked-up picture of each sheet are stored in your Supabase project. Handwriting is read on the phone; nothing goes to other services.
 - Check the district's rules on storing student data in personal apps.

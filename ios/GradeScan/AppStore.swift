@@ -1,47 +1,46 @@
-import AVFoundation
+import Combine
 import SwiftUI
 import UIKit
 
+/// Account, tests, the class list, and the upload queue. Scanning itself lives in `ScanSession`.
 @MainActor
 final class AppStore: ObservableObject {
+    enum Tab: Hashable { case scan, tests }
+
     @Published var session: Session?
-    @Published var status = "Point the camera at an answer sheet"
-    @Published var detail = ""
-    @Published var sent = 0
+    @Published var tests: [Quiz] = []
+    @Published var loaded = false
+    @Published var students: [Student] = []   // the class list, for matching names; managed in the portal
+    @Published var summaries: [String: TestSummary] = [:]   // by test id
     @Published var pending: [ScanUpload] = []
     @Published var problem: String?
+    @Published var tab: Tab = .scan
 
-    let scanner = Scanner()
-    let preview = PreviewView()
+    /// Local photos still shown on the phone; the upload queue keeps them after uploading.
+    var keepPhotos: Set<String> = []
+    /// Scans saved without their student because the student already had a scan for the test: scan id → the other scan.
+    @Published var conflicts: [String: String] = [:]
 
-    private var quizzes: [String: Quiz] = [:]
-    private var names: [String: String] = [:]
-    private var candidate = ""
-    private var streak = 0
-    private var lastSaved = ""
+    struct TestSummary {
+        let count: Int
+        let average: Double?
+    }
+
     private var sending = false
-    private let voice = AVSpeechSynthesizer()
-
-    /// Identical reads in a row before a sheet is accepted (filters motion blur and hands).
-    private let framesToAccept = 5
+    private var deleted: Set<String> = []    // removed while their upload was in flight
 
     init() {
         session = Keychain.get("session").flatMap { try? JSONDecoder().decode(Session.self, from: $0) }
+        Keychain.set("nameKey", nil)   // left over from the roster passphrase in earlier versions
         pending = UserDefaults.standard.data(forKey: "pending").flatMap { try? API.decoder.decode([ScanUpload].self, from: $0) } ?? []
-        preview.previewLayer.session = scanner.session
-        try? AVAudioSession.sharedInstance().setCategory(.playback, options: .duckOthers)
-        scanner.onEvent = { [weak self] event in
-            Task { @MainActor in self?.handle(event) }
-        }
     }
 
     // MARK: Account
 
-    func signIn(email: String, password: String, passphrase: String) async {
+    func signIn(email: String, password: String) async {
         problem = nil
         do {
             let s = try await API.signIn(email: email.trimmingCharacters(in: .whitespaces), password: password)
-            Keychain.set("nameKey", passphrase.isEmpty ? nil : NameCrypto.deriveKey(passphrase, userId: s.userId))
             Keychain.set("session", try? JSONEncoder().encode(s))
             session = s
         } catch {
@@ -52,10 +51,9 @@ final class AppStore: ObservableObject {
     func signOut() {
         session = nil
         Keychain.set("session", nil)
-        Keychain.set("nameKey", nil)
-        quizzes = [:]
-        names = [:]
-        scanner.setQuizzes([:])
+        tests = []
+        students = []
+        summaries = [:]
     }
 
     private func validToken() async throws -> String {
@@ -73,90 +71,178 @@ final class AppStore: ObservableObject {
         return s.accessToken
     }
 
-    // MARK: Data
+    // MARK: Tests
 
     func reload() async {
+        problem = nil
         do {
             let token = try await validToken()
-            let list = try await API.quizzes(token)
-            quizzes = Dictionary(list.map { ($0.code, $0) }, uniquingKeysWith: { first, _ in first })
-            scanner.setQuizzes(quizzes)
-            names = [:]
-            var note = ""
-            if let key = Keychain.get("nameKey") {
-                let rows = try await API.students(token)
-                for row in rows { names[row.code] = NameCrypto.decrypt(row.nameEnc, key) }
-                if !rows.isEmpty && names.isEmpty { note = "Roster passphrase doesn't match — showing Student # only." }
-            }
-            show("\(quizzes.count) quizzes loaded — point at a sheet", note)
+            tests = try await API.tests(token).filter(\.scannable)
+            loaded = true
+            students = try await API.students(token)
+            await loadSummaries()
             await send()
         } catch {
             problem = error.localizedDescription
         }
     }
 
+    /// Scanned count and average for each test, for the Tests list.
+    func loadSummaries() async {
+        guard let token = try? await validToken(), let rows = try? await API.scanSummaries(token) else { return }
+        var out: [String: TestSummary] = [:]
+        for (quizId, scans) in Dictionary(grouping: rows, by: \.quizId) {
+            guard let quiz = tests.first(where: { $0.id == quizId }) else { continue }
+            let stats = TestStats(quiz: quiz, sheets: scans.map { ScoredSheet(answers: $0.answers, period: nil, override: $0.scoreOverride) })
+            out[quizId] = TestSummary(count: stats.count, average: stats.average)
+        }
+        summaries = out
+    }
+
+    func createTest(title: String, questions: Int, choices: Int, key: String, points: Double, bonus: Int) async -> Bool {
+        do {
+            let token = try await validToken()
+            let used = Set(tests.compactMap(\.sheetCode))
+            let code = (1...4095).filter { !used.contains($0) }.randomElement() ?? 1
+            let quiz = try await API.createTest(title: title, questions: questions, choices: choices, key: key,
+                                                points: points, bonus: bonus, code: code, token)
+            tests.insert(quiz, at: 0)
+            return true
+        } catch {
+            problem = error.localizedDescription
+            return false
+        }
+    }
+
+    /// A test's scans from the server, plus any still waiting to upload.
+    func scans(for quiz: Quiz) async throws -> [ScanRecord] {
+        let token = try await validToken()
+        let server = try await API.scans(quiz.id, token)
+        let local = pending.filter { $0.quizId == quiz.id && !server.map(\.id).contains($0.id) }.map(ScanRecord.init)
+        return local + server
+    }
+
+    /// One saved scan (the other half of a comparison).
+    func record(_ id: String) async -> ScanRecord? {
+        guard let token = try? await validToken() else { return nil }
+        return try? await API.scan(id, token)
+    }
+
+    /// A marked sheet photo from storage.
+    func photo(_ path: String) async -> UIImage? {
+        guard let token = try? await validToken(), let data = try? await API.photo(path, token) else { return nil }
+        return UIImage(data: data)
+    }
+
+    // MARK: Uploads
+
+    func enqueue(_ upload: ScanUpload) {
+        pending.append(upload)
+        savePending()
+        Task { await send() }
+    }
+
     func send() async {
         guard !sending, session != nil else { return }
         sending = true
         defer { sending = false }
-        problem = nil
-        while let next = pending.first {
+        while var next = pending.first {
             do {
                 let token = try await validToken()
-                try await API.upsert(next, token)
+                if next.photoPath == nil, let file = next.localPhoto, let data = Photos.load(file), let user = session?.userId {
+                    let path = "\(user)/\(next.id).clean.jpg"   // no marks on it: the apps draw them
+                    try await API.uploadPhoto(path, data, token)
+                    next.photoPath = path
+                    if let i = pending.firstIndex(where: { $0.id == next.id }) { pending[i].photoPath = path; savePending() }
+                }
+                do {
+                    try await API.insert(next, token)
+                } catch let e as APIError where e.status == 409 && next.studentId != nil {
+                    // The student already has a scan for this test. Save this one without the student; the teacher compares.
+                    let other = try await API.scanId(quizId: next.quizId, studentId: next.studentId ?? "", token)
+                    next.studentId = nil
+                    try await API.insert(next, token)
+                    if let i = pending.firstIndex(where: { $0.id == next.id }) { pending[i].studentId = nil; savePending() }
+                    if let other { conflicts[next.id] = other }
+                }
+                if let file = next.localPhoto, !keepPhotos.contains(file) { Photos.remove(file) }
+                // Fixed or removed while it was uploading: apply that now.
+                if deleted.remove(next.id) != nil {
+                    try await API.delete(next.id, token)
+                } else if let now = pending.first(where: { $0.id == next.id }),
+                          now.studentId != next.studentId || now.studentName != next.studentName || now.period != next.period
+                            || now.answers != next.answers || now.review != next.review {
+                    try await API.update(next.id, ScanPatch(studentId: now.studentId, studentName: now.studentName, period: now.period,
+                                                            answers: now.answers, review: now.review), token)
+                }
             } catch {
-                problem = "Not sent yet: \(error.localizedDescription) Tap ⋯ › Retry sending."
+                problem = "Not uploaded yet: \(error.localizedDescription)"
                 return
             }
-            pending.removeFirst()
-            sent += 1
+            pending.removeAll { $0.id == next.id }
             savePending()
+        }
+        problem = nil
+        await loadSummaries()
+    }
+
+    /// Removes a scan, from the queue or from the server.
+    func remove(_ id: String) async {
+        if let i = pending.firstIndex(where: { $0.id == id }) {
+            if sending && i == 0 { deleted.insert(id) } else { pending.remove(at: i); savePending() }
+            return
+        }
+        do {
+            try await API.delete(id, try await validToken())
+            await loadSummaries()
+        } catch {
+            problem = "Couldn't delete: \(error.localizedDescription)"
+        }
+    }
+
+    /// Saves a fix to a scan: in the queue if it hasn't uploaded yet, otherwise on the server.
+    /// If the student already has another scan for the test (`quizId`), the fix is saved without the student and the
+    /// pair is reported in `conflicts`, for the teacher to compare.
+    func fix(_ id: String, studentId: String?, name: String?, period: Int?, answers: String? = nil, review: [String: RowReview]? = nil,
+             quizId: String? = nil) async {
+        let name = name?.trimmingCharacters(in: .whitespaces).nilIfEmpty
+        if let i = pending.firstIndex(where: { $0.id == id }) {
+            pending[i].studentId = studentId
+            pending[i].studentName = name
+            pending[i].period = period
+            if let answers { pending[i].answers = answers }
+            if let review { pending[i].review = review }
+            savePending()
+            return
+        }
+        do {
+            let token = try await validToken()
+            do {
+                try await API.update(id, ScanPatch(studentId: studentId, studentName: name, period: period, answers: answers, review: review), token)
+            } catch let e as APIError where e.status == 409 && studentId != nil && quizId != nil {
+                try await API.update(id, ScanPatch(studentId: nil, studentName: name, period: period, answers: answers, review: review), token)
+                if let other = try await API.scanId(quizId: quizId ?? "", studentId: studentId ?? "", token) { conflicts[id] = other }
+            }
+            await loadSummaries()
+        } catch {
+            problem = "Couldn't save the fix: \(error.localizedDescription)"
         }
     }
 
     private func savePending() {
         UserDefaults.standard.set(try? API.encoder.encode(pending), forKey: "pending")
     }
+}
 
-    // MARK: Scanning
+extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
+}
 
-    private func handle(_ event: ScanEvent) {
-        switch event {
-        case .nothing:
-            streak = 0
-            preview.draw([], nil)
-        case .cameraDenied:
-            show("Camera access is off", "Turn it on in Settings › GradeScan › Camera.")
-        case .unknownQuiz(let code):
-            streak = 0
-            preview.draw([], nil)
-            show("Quiz \(code) isn't loaded", "Create it in the portal, then tap ⋯ › Reload.")
-        case .sheet(let quiz, let student, let answers, let map):
-            preview.draw(Grader.marks(quiz, answers), map)
-            let key = "\(quiz.code)|\(student ?? "?")|\(answers)"
-            if key == candidate { streak += 1 } else { candidate = key; streak = 1 }
-            guard streak == framesToAccept, key != lastSaved else { return }
-            lastSaved = key
-            accept(quiz, student, answers)
-        }
-    }
-
-    private func accept(_ quiz: Quiz, _ student: String?, _ answers: String) {
-        let g = Grader.grade(quiz, answers)
-        let who = student.map { names[$0] ?? "Student #\($0)" } ?? "Student # unreadable (fix it in the portal)"
-        show("\(who): \(fmt(g.score))/\(fmt(g.max))",
-             g.missed.isEmpty ? "No misses" : "Missed " + g.missed.map(String.init).joined(separator: ", "))
-        voice.speak(AVSpeechUtterance(string: "\(fmt(g.score)) out of \(fmt(g.max))"))
-        UINotificationFeedbackGenerator().notificationOccurred(student == nil ? .warning : .success)
-        // An unreadable Student # is saved as "?XX" so scanning never stops; she fixes it in the portal.
-        let code = student ?? "?" + String((0..<2).map { _ in "ABCDEFGHJKMNPQRSTUVWXYZ23456789".randomElement()! })
-        pending.append(ScanUpload(quizId: quiz.id, studentCode: code, answers: answers, scannedAt: Date()))
-        savePending()
-        Task { await send() }
-    }
-
-    private func show(_ newStatus: String, _ newDetail: String) {
-        if status != newStatus { status = newStatus }
-        if detail != newDetail { detail = newDetail }
+extension UIImage {
+    /// A picture from a data URL such as the handwritten name stored with each scan.
+    convenience init?(dataURL: String?) {
+        guard let url = dataURL, let comma = url.firstIndex(of: ","),
+              let data = Data(base64Encoded: String(url[url.index(after: comma)...])) else { return nil }
+        self.init(data: data)
     }
 }

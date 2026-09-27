@@ -1,42 +1,109 @@
-import CommonCrypto
-import CryptoKit
 import Foundation
 import Security
 
 // Paste the same values as in portal/index.html (Supabase → Project Settings → API).
 enum Config {
-    static let supabaseURL = "https://YOUR-PROJECT-REF.supabase.co"
-    static let supabaseKey = "YOUR-PUBLISHABLE-OR-ANON-KEY"
+    static let supabaseURL = "https://rxpfbifdwnjwvfyxbtyy.supabase.co"
+    static let supabaseKey = "sb_publishable_gG2malUV5jX565KBfF7w_g_VREOHTNJ"
 }
 
-struct Session: Codable {
+struct Session: Codable, Sendable {
     var accessToken: String
     var refreshToken: String
     var userId: String
     var expiresAt: Date
 }
 
-struct Quiz: Codable {
+/// A test as created in the portal. `layout` says where everything is printed on its answer sheet.
+struct Quiz: Codable, Identifiable, Sendable {
     let id: String
-    let code: String
     let title: String
     let numQuestions: Int
     let numChoices: Int
     let answerKey: String
     let pointsPerQuestion: Double
     let bonusCount: Int
+    let layout: SheetLayout?
+    let code: String?
+
+    /// The number printed on this test's sheets, which is how the phone recognizes them.
+    var sheetCode: Int? { code.flatMap { Int($0) }.flatMap { (1...4095).contains($0) ? $0 : nil } }
+
+    /// Tests whose sheet the phone can read.
+    var scannable: Bool { sheetCode != nil && layout?.fits(questions: numQuestions, choices: numChoices) == true }
 }
 
-struct StudentRow: Codable {
-    let code: String
-    let nameEnc: String
+/// A student on the class list.
+struct Student: Codable, Identifiable, Sendable, Hashable {
+    let id: String
+    let name: String
+    let period: Int?
+    let number: Int?   // printed on the student's named sheets
 }
 
-struct ScanUpload: Codable {
+struct ScanUpload: Codable, Sendable, Identifiable {
+    var id = UUID().uuidString.lowercased()   // made on the phone, so a scan can be fixed or undone right away
     let quizId: String
-    let studentCode: String
-    let answers: String
+    var studentId: String?
+    var period: Int?
+    var studentName: String?   // read from the handwriting; can be corrected on the phone or in the portal
+    let nameImage: String?     // JPEG data URL of the handwritten name
+    var sheetImage: String?    // older builds: JPEG data URL of the marked sheet (now stored as a file, see photoPath)
+    var photoPath: String?     // the marked full-resolution photo in the "sheets" storage bucket
+    var localPhoto: String?    // that photo on the phone until it's uploaded (never sent to the table)
+    var answers: String
     let scannedAt: Date
+    var review: [String: RowReview]?   // rows waiting for (or settled by) the teacher, by question index
+}
+
+/// Fields the teacher can fix after a scan.
+struct ScanPatch: Encodable {
+    let studentId: String?
+    let studentName: String?
+    let period: Int?
+    var answers: String? = nil
+    var review: [String: RowReview]? = nil
+
+    func encode(to encoder: Encoder) throws {   // send nulls too, so clearing a field works
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(studentId, forKey: .studentId)
+        try c.encode(studentName, forKey: .studentName)
+        try c.encode(period, forKey: .period)
+        if let answers { try c.encode(answers, forKey: .answers) }
+        if let review { try c.encode(review, forKey: .review) }
+    }
+    enum CodingKeys: String, CodingKey { case studentId, studentName, period, answers, review }
+}
+
+/// A saved scan as the server has it (for a test's stats and results).
+struct ScanRecord: Codable, Identifiable, Sendable, Equatable {
+    let id: String
+    let quizId: String
+    var period: Int?
+    var studentId: String?
+    var studentName: String?
+    let nameImage: String?
+    var answers: String
+    let scoreOverride: Double?
+    let scannedAt: Date
+    let photoPath: String?
+    var review: [String: RowReview]?
+}
+
+extension ScanRecord {
+    /// A scan still waiting to upload.
+    init(_ upload: ScanUpload) {
+        self.init(id: upload.id, quizId: upload.quizId, period: upload.period, studentId: upload.studentId, studentName: upload.studentName,
+                  nameImage: upload.nameImage, answers: upload.answers, scoreOverride: nil, scannedAt: upload.scannedAt, photoPath: upload.photoPath,
+                  review: upload.review)
+    }
+}
+
+/// Just enough of every scan to show each test's count and average.
+struct ScanSummaryRow: Codable, Sendable {
+    let quizId: String
+    let answers: String
+    let scoreOverride: Double?
 }
 
 struct APIError: LocalizedError {
@@ -45,7 +112,7 @@ struct APIError: LocalizedError {
     var errorDescription: String? { message }
 }
 
-/// Minimal Supabase REST client: sign in, read quizzes and roster, upsert scans.
+/// Minimal Supabase REST client: sign in, read tests and scans, save scans.
 enum API {
     static let encoder: JSONEncoder = {
         let e = JSONEncoder()
@@ -57,9 +124,36 @@ enum API {
     static let decoder: JSONDecoder = {
         let d = JSONDecoder()
         d.keyDecodingStrategy = .convertFromSnakeCase
-        d.dateDecodingStrategy = .iso8601
+        d.dateDecodingStrategy = .custom { decoder in
+            let text = try decoder.singleValueContainer().decode(String.self)
+            guard let date = parseDate(text) else {
+                throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Bad date \(text)"))
+            }
+            return date
+        }
         return d
     }()
+
+    private static let withFraction: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private static let plain: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
+    /// ISO 8601 with or without fractional seconds. Postgres sends microseconds; the formatter wants milliseconds.
+    static func parseDate(_ text: String) -> Date? {
+        var t = text
+        if let dot = t.firstIndex(of: "."), let end = t[dot...].firstIndex(where: { $0 == "+" || $0 == "-" || $0 == "Z" }) {
+            let digits = String(t[t.index(after: dot)..<end].prefix(3))
+            t.replaceSubrange(t.index(after: dot)..<end, with: digits.padding(toLength: 3, withPad: "0", startingAt: 0))
+        }
+        return withFraction.date(from: t) ?? plain.date(from: t)
+    }
 
     private struct AuthResponse: Decodable {
         struct User: Decodable { let id: String }
@@ -77,20 +171,80 @@ enum API {
         try await auth("refresh_token", ["refresh_token": refreshToken])
     }
 
-    static func quizzes(_ token: String) async throws -> [Quiz] {
-        let data = try await request("/rest/v1/quizzes?select=id,code,title,num_questions,num_choices,answer_key,points_per_question,bonus_count", token: token)
+    /// Newest first.
+    static func tests(_ token: String) async throws -> [Quiz] {
+        let data = try await request("/rest/v1/quizzes?select=id,title,num_questions,num_choices,answer_key,points_per_question,bonus_count,layout,code&order=created_at.desc", token: token)
         return try decoder.decode([Quiz].self, from: data)
     }
 
-    static func students(_ token: String) async throws -> [StudentRow] {
-        let data = try await request("/rest/v1/students?select=code,name_enc", token: token)
-        return try decoder.decode([StudentRow].self, from: data)
+    static func students(_ token: String) async throws -> [Student] {
+        let data = try await request("/rest/v1/students?select=id,name,period,number&order=name", token: token)
+        return try decoder.decode([Student].self, from: data)
     }
 
-    /// Insert, or replace the earlier scan of the same student for the same quiz.
-    static func upsert(_ scan: ScanUpload, _ token: String) async throws {
-        _ = try await request("/rest/v1/scans?on_conflict=quiz_id,student_code", method: "POST", token: token,
-                              body: try encoder.encode([scan]), prefer: "resolution=merge-duplicates,return=minimal")
+    /// A test's scans, newest first.
+    static func scans(_ quizId: String, _ token: String) async throws -> [ScanRecord] {
+        let data = try await request("/rest/v1/scans?quiz_id=eq.\(quizId)&select=id,quiz_id,period,student_id,student_name,name_image,answers,score_override,scanned_at,photo_path,review&order=scanned_at.desc", token: token)
+        return try decoder.decode([ScanRecord].self, from: data)
+    }
+
+    static func scanSummaries(_ token: String) async throws -> [ScanSummaryRow] {
+        let data = try await request("/rest/v1/scans?select=quiz_id,answers,score_override", token: token)
+        return try decoder.decode([ScanSummaryRow].self, from: data)
+    }
+
+    /// A marked sheet photo from the private "sheets" bucket.
+    static func photo(_ path: String, _ token: String) async throws -> Data {
+        try await request("/storage/v1/object/authenticated/sheets/\(path)", token: token)
+    }
+
+    /// Creates a test with its sheet layout and a code the phone can recognize on printed sheets.
+    static func createTest(title: String, questions: Int, choices: Int, key: String, points: Double, bonus: Int,
+                           code: Int, _ token: String) async throws -> Quiz {
+        struct Row: Encodable {
+            let title: String, numQuestions: Int, numChoices: Int, answerKey: String, pointsPerQuestion: Double
+            let bonusCount: Int, code: String, layout: SheetLayout
+        }
+        let row = Row(title: title, numQuestions: questions, numChoices: choices, answerKey: key, pointsPerQuestion: points,
+                      bonusCount: bonus, code: String(code), layout: SheetDesign.layout(questions: questions, choices: choices))
+        let data = try await request("/rest/v1/quizzes?select=id,title,num_questions,num_choices,answer_key,points_per_question,bonus_count,layout,code",
+                                     method: "POST", token: token, body: try encoder.encode([row]), prefer: "return=representation")
+        guard let quiz = try decoder.decode([Quiz].self, from: data).first else { throw APIError(status: 0, message: "Not saved") }
+        return quiz
+    }
+
+    static func insert(_ scan: ScanUpload, _ token: String) async throws {
+        var row = scan
+        row.localPhoto = nil   // phone-only
+        // Sending the same scan twice (a retry) updates it. A second scan of a student who already has one for the
+        // test fails with 409, and the caller saves it unassigned for the teacher to compare.
+        _ = try await request("/rest/v1/scans?on_conflict=id", method: "POST", token: token,
+                              body: try encoder.encode([row]), prefer: "resolution=merge-duplicates,return=minimal")
+    }
+
+    static func uploadPhoto(_ path: String, _ jpeg: Data, _ token: String) async throws {
+        _ = try await request("/storage/v1/object/sheets/\(path)", method: "POST", token: token, body: jpeg,
+                              contentType: "image/jpeg", upsert: true)
+    }
+
+    static func update(_ id: String, _ patch: ScanPatch, _ token: String) async throws {
+        _ = try await request("/rest/v1/scans?id=eq.\(id)", method: "PATCH", token: token, body: try encoder.encode(patch), prefer: "return=minimal")
+    }
+
+    static func scan(_ id: String, _ token: String) async throws -> ScanRecord? {
+        let data = try await request("/rest/v1/scans?id=eq.\(id)&select=id,quiz_id,period,student_id,student_name,name_image,answers,score_override,scanned_at,photo_path,review", token: token)
+        return try decoder.decode([ScanRecord].self, from: data).first
+    }
+
+    /// The student's scan for a test, if they have one.
+    static func scanId(quizId: String, studentId: String, _ token: String) async throws -> String? {
+        struct Row: Decodable { let id: String }
+        let data = try await request("/rest/v1/scans?quiz_id=eq.\(quizId)&student_id=eq.\(studentId)&select=id", token: token)
+        return try decoder.decode([Row].self, from: data).first?.id
+    }
+
+    static func delete(_ id: String, _ token: String) async throws {
+        _ = try await request("/rest/v1/scans?id=eq.\(id)", method: "DELETE", token: token)
     }
 
     private static func auth(_ grant: String, _ body: [String: String]) async throws -> Session {
@@ -100,8 +254,8 @@ enum API {
                        expiresAt: Date().addingTimeInterval(r.expiresIn))
     }
 
-    private static func request(_ path: String, method: String = "GET", token: String? = nil,
-                                body: Data? = nil, prefer: String? = nil) async throws -> Data {
+    private static func request(_ path: String, method: String = "GET", token: String? = nil, body: Data? = nil,
+                                prefer: String? = nil, contentType: String = "application/json", upsert: Bool = false) async throws -> Data {
         guard let url = URL(string: Config.supabaseURL + path) else { throw APIError(status: 0, message: "Bad Supabase URL in Supabase.swift") }
         var req = URLRequest(url: url)
         req.httpMethod = method
@@ -109,9 +263,10 @@ enum API {
         if let token { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         if let body {
             req.httpBody = body
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue(contentType, forHTTPHeaderField: "Content-Type")
         }
         if let prefer { req.setValue(prefer, forHTTPHeaderField: "Prefer") }
+        if upsert { req.setValue("true", forHTTPHeaderField: "x-upsert") }
         let (data, response) = try await URLSession.shared.data(for: req)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(status) else {
@@ -140,23 +295,5 @@ enum Keychain {
                                     kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
         var out: CFTypeRef?
         return SecItemCopyMatching(query as CFDictionary, &out) == errSecSuccess ? out as? Data : nil
-    }
-}
-
-/// Same scheme as the portal: PBKDF2-SHA256 (310,000 rounds, salt "gradescan:<user id>") → AES-256-GCM.
-enum NameCrypto {
-    static func deriveKey(_ passphrase: String, userId: String) -> Data? {
-        let salt = Array("gradescan:\(userId)".utf8)
-        var key = [UInt8](repeating: 0, count: 32)
-        let status = CCKeyDerivationPBKDF(CCPBKDFAlgorithm(kCCPBKDF2), passphrase, passphrase.utf8.count, salt, salt.count,
-                                          CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA256), 310_000, &key, key.count)
-        return status == Int32(kCCSuccess) ? Data(key) : nil
-    }
-
-    static func decrypt(_ base64: String, _ key: Data) -> String? {
-        guard let data = Data(base64Encoded: base64),
-              let box = try? AES.GCM.SealedBox(combined: data),
-              let plain = try? AES.GCM.open(box, using: SymmetricKey(data: key)) else { return nil }
-        return String(decoding: plain, as: UTF8.self)
     }
 }
