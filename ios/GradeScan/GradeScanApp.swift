@@ -20,9 +20,15 @@ struct GradeScanApp: App {
 
 struct RootView: View {
     @EnvironmentObject var store: AppStore
+    @Environment(\.scenePhase) private var phase
 
     var body: some View {
-        if store.session == nil { LoginView() } else { MainTabs() }
+        Group {
+            if store.session == nil { LoginView() } else { MainTabs() }
+        }
+        .task { await store.keepSending() }
+        // Coming back to the app: fresh tests and class list, and another try at anything waiting to upload.
+        .onChange(of: phase) { _, now in if now == .active, store.session != nil { Task { await store.reload() } } }
     }
 }
 

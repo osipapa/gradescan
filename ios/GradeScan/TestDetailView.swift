@@ -209,7 +209,7 @@ struct RecordSheet: View {
                                           nameImage: record.nameImage, photoPath: record.photoPath,
                                           suggestion: record.studentId == nil
                                               ? NameMatch.decide(record.studentName, among: store.students, period: record.period).suggest : nil,
-                                          rows: rows, layout: record.layout(quiz)),
+                                          rows: rows, layout: record.layout(quiz), takenOn: record.takenOn),
                            assign: { student in
                                // One scan per student per test: if they already have one, compare the two first.
                                if let student, let other = others.first(where: { $0.studentId == student.id }) {

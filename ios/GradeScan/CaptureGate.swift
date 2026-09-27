@@ -27,10 +27,10 @@ enum GateOutput: Equatable {
 /// sheet leaves the view, or a clearly different sheet is in front of the camera. Hovering, a bubble that flickers
 /// between readings, and glare can't capture the same sheet twice.
 struct CaptureGate {
-    static let steadyStep = 0.01          // most a corner may move between frames (normalized image units)
-    static let steadyDrift = 0.03         // most a corner may drift over the whole steady run
-    static let lockDuration: TimeInterval = 0.35
-    static let minReads = 6
+    static let steadyStep = 0.014         // most a corner may move between frames (normalized image units)
+    static let steadyDrift = 0.045        // most a corner may drift over the whole steady run
+    static let lockDuration: TimeInterval = 0.3
+    static let minReads = 5
     static let window = 15
     static let agreement = 0.6
     static let clearDuration: TimeInterval = 0.5

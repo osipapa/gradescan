@@ -30,7 +30,7 @@ final class ScanSession: ObservableObject {
     @Published private(set) var single: ScanItem? { didSet { photosChanged() } }        // single mode's card
     @Published var card: CardRef?           // a card open over the camera
     @Published var showReview = false
-    @Published private(set) var reviewId: String?
+    @Published var reviewId: String?   // the sheet showing in review
     @Published private(set) var rescanning: String?
     @Published private(set) var pill = Pill(text: "Point at a sheet")
     @Published private(set) var unknownTest = false
@@ -54,7 +54,10 @@ final class ScanSession: ObservableObject {
     private var fallbackNames: [String: GrayStrip] = [:]   // video-frame names, in case the photo fails
     private var fallbackPeriods: [String: GrayStrip] = [:] // ZipGrade: video-frame period boxes, in case the photo fails
     private var periodStrips: [String: GrayStrip] = [:]    // ZipGrade: period boxes waiting to be read
+    private var fallbackDates: [String: GrayStrip] = [:]   // ZipGrade: video-frame date boxes, in case the photo fails
+    private var dateStrips: [String: GrayStrip] = [:]      // ZipGrade: date boxes waiting to be read
     private var captureShown: (pill: Pill, at: Date, id: String)?
+    private var capturedTogether = 0
     private var rescanFromReview = false
     private var heldForCard = false
     private var watch: AnyCancellable?
@@ -136,9 +139,18 @@ final class ScanSession: ObservableObject {
         if isBatch(item.id) { saveBatch() }
     }
 
+    /// The period on the sheet isn't the one the student has on the class list.
+    private func mismatch(_ item: ScanItem) -> Bool {
+        guard let p = item.period, let listed = student(item.studentId)?.period else { return false }
+        return p != listed
+    }
+
     /// Notes that belong on an item's card.
     func notes(_ item: ScanItem) -> [String] {
         var out: [String] = []
+        if item.periodMismatch, let p = item.period, let s = student(item.studentId), let listed = s.period {
+            out.append("Period \(p) on the sheet, but \(s.name) is in period \(listed) on your class list.")
+        }
         if item.photoFailed { out.append("No clear photo. Check this sheet on paper.") }
         if item.duplicateOf == nil, isBatch(item.id), let j = BatchRules.lookalike(item, in: items), let n = position(items[j].id) {
             out.append("Looks like the same sheet as #\(n).")
@@ -154,20 +166,24 @@ final class ScanSession: ObservableObject {
             cameraDenied = true
             setPill(Pill(text: "Camera access is off", tone: .warn))
         case .frame(let f):
-            let quad = f.map.map { map in (f.layout?.cornerPoints ?? BoxFinder.unitCorners).map { map.apply($0) } }
-            if zipgradeInView != f.zipgrade { zipgradeInView = f.zipgrade }
-            if f.needsTest, !askZipGrade, Date() > zipgradeQuietUntil { askZipGrade = true }
-            let look: PreviewView.Look
-            switch f.gate {
-            case .locking(let p): look = f.unknownTest || f.wrongTest ? .warn : .locking(p)
-            case .waiting, .fire: look = .done
-            case .blank: look = .warn
-            case .idle: look = f.unknownTest || f.wrongTest ? .warn : .plain
-            }
-            preview.show(quad, look)
-            if unknownTest != f.unknownTest {
-                unknownTest = f.unknownTest
-                if f.unknownTest { haptics.notificationOccurred(.warning) }
+            let zipgrade = f.sheets.contains { $0.zipgrade }
+            if zipgradeInView != zipgrade { zipgradeInView = zipgrade }
+            if f.sheets.contains(where: \.needsTest), !askZipGrade, Date() > zipgradeQuietUntil { askZipGrade = true }
+            preview.show(f.sheets.compactMap { sheet in
+                guard let map = sheet.map else { return nil }
+                let look: PreviewView.Look
+                switch sheet.gate {
+                case .locking(let p): look = sheet.unknownTest || sheet.wrongTest ? .warn : .locking(p)
+                case .waiting, .fire: look = .done
+                case .blank: look = .warn
+                case .idle: look = sheet.unknownTest || sheet.wrongTest || sheet.needsTest ? .warn : .plain
+                }
+                return (sheet.track, (sheet.layout?.cornerPoints ?? BoxFinder.unitCorners).map { map.apply($0) }, look)
+            })
+            let unknown = f.sheets.contains(where: \.unknownTest)
+            if unknownTest != unknown {
+                unknownTest = unknown
+                if unknown { haptics.notificationOccurred(.warning) }
             }
             updatePill(f)
         case .captured(let c):
@@ -179,17 +195,21 @@ final class ScanSession: ObservableObject {
 
     private func updatePill(_ f: FrameInfo) {
         if let shown = captureShown, Date().timeIntervalSince(shown.at) < 1.6 { return setPill(shown.pill) }
-        if f.unknownTest { return setPill(Pill(text: "Not one of your tests", tone: .warn)) }
-        if f.needsTest { return setPill(Pill(text: "ZipGrade sheet: which test?", tone: .warn)) }
-        if f.wrongTest, let q = f.quiz { return setPill(Pill(text: "This sheet is for \(q.title)", tone: .warn)) }
-        switch f.gate {
-        case .idle:
-            setPill(store.loaded && store.tests.isEmpty ? Pill(text: "No tests yet. Create one first.", tone: .warn)
-                                                        : Pill(text: rescanning == nil ? "Point at a sheet" : "Point at the sheet to rescan"))
-        case .locking: setPill(Pill(text: "Hold steady"))
-        case .blank: setPill(Pill(text: "Nothing filled in", tone: .warn))
-        case .waiting, .fire: setPill(Pill(text: mode == .batch ? "Next sheet" : "Captured", tone: .good))
+        if f.sheets.contains(where: \.unknownTest) { return setPill(Pill(text: "Not one of your tests", tone: .warn)) }
+        if f.sheets.contains(where: \.needsTest) { return setPill(Pill(text: "ZipGrade sheet: which test?", tone: .warn)) }
+        if let q = f.sheets.first(where: \.wrongTest)?.quiz { return setPill(Pill(text: "This sheet is for \(q.title)", tone: .warn)) }
+        let gates = f.sheets.map(\.gate)
+        let several = f.sheets.count > 1 ? "\(f.sheets.count) sheets · " : ""
+        if gates.isEmpty {
+            return setPill(store.loaded && store.tests.isEmpty ? Pill(text: "No tests yet. Create one first.", tone: .warn)
+                                                               : Pill(text: rescanning == nil ? "Point at the sheets" : "Point at the sheet to rescan"))
         }
+        if gates.contains(where: { if case .locking = $0 { return true } else { return false } }) { return setPill(Pill(text: several + "Hold steady")) }
+        if gates.contains(.blank) { return setPill(Pill(text: several + "Nothing filled in", tone: .warn)) }
+        if gates.allSatisfy({ $0 == .waiting || { if case .fire = $0 { return true } else { return false } }($0) }) {
+            return setPill(Pill(text: mode == .batch ? (f.sheets.count > 1 ? "All captured · next ones" : "Next sheet") : "Captured", tone: .good))
+        }
+        setPill(Pill(text: several + "Hold steady"))
     }
 
     private func setPill(_ p: Pill) { if pill != p { pill = p } }
@@ -199,6 +219,7 @@ final class ScanSession: ObservableObject {
         if c.kind == .zipgrade20 {
             item.form = SheetKind.zipgrade20.rawValue
             if let box = c.periodBox { fallbackPeriods[c.id] = box }
+            if let box = c.dateBox { fallbackDates[c.id] = box }
         }
         if let number = c.number, let student = store.students.first(where: { $0.number == number }) {
             item.studentId = student.id
@@ -206,9 +227,15 @@ final class ScanSession: ObservableObject {
             if item.period == nil { item.period = student.period }
         }
         if let name = c.name { fallbackNames[c.id] = name }
-        preview.flash()
+        preview.flash(c.track)
         haptics.notificationOccurred(.success)
-        captureShown = (Pill(text: "✓ \(c.quiz.scoreText(c.answers))\(item.studentName.map { " · \(Self.short($0))" } ?? "")", tone: .good), Date(), c.id)
+        // Several sheets captured together: count them rather than showing one score.
+        let together = captureShown.map { Date().timeIntervalSince($0.at) < 0.5 } ?? false
+        capturedTogether = together ? capturedTogether + 1 : 1
+        captureShown = (capturedTogether > 1
+                        ? Pill(text: "✓ \(capturedTogether) sheets captured", tone: .good)
+                        : Pill(text: "✓ \(c.quiz.scoreText(c.answers))\(item.studentName.map { " · \(Self.short($0))" } ?? "")", tone: .good),
+                        Date(), c.id)
         setPill(captureShown!.pill)
 
         if let target = rescanning {
@@ -256,6 +283,8 @@ final class ScanSession: ObservableObject {
         fallbackNames[p.id] = nil
         if let box = p.periodBox ?? fallbackPeriods[p.id] { periodStrips[p.id] = box }
         fallbackPeriods[p.id] = nil
+        if let box = p.dateBox ?? fallbackDates[p.id] { dateStrips[p.id] = box }
+        fallbackDates[p.id] = nil
         Task { await finalize(p.id, strip) }
     }
 
@@ -265,8 +294,11 @@ final class ScanSession: ObservableObject {
         if let strip { read = await NameReader.read(strip) }
         var writtenPeriod: Int?   // ZipGrade: the period is written in a box, not bubbled
         if let box = periodStrips.removeValue(forKey: id) { writtenPeriod = await NameReader.readPeriod(box) }
+        var writtenDate: String?
+        if let box = dateStrips.removeValue(forKey: id) { writtenDate = await NameReader.readDate(box) }
         guard var item = self.item(id) else { return }
         if item.period == nil { item.period = writtenPeriod }
+        if item.takenOn == nil { item.takenOn = writtenDate }
         item.read = read
         item.nameImage = strip?.jpegDataURL()
         if item.studentId == nil {
@@ -283,6 +315,7 @@ final class ScanSession: ObservableObject {
         }
         if item.studentName == nil { item.studentName = read }
         item.processing = false
+        item.periodMismatch = mismatch(item)
         if isBatch(id), let j = BatchRules.duplicate(item, in: items) {
             // The same student again: nothing is replaced. This one waits, without the student, for the teacher to compare.
             let other = items[j]
@@ -292,7 +325,7 @@ final class ScanSession: ObservableObject {
         }
         update(item)
         store.enqueue(item.upload)
-        if let shown = captureShown, shown.id == id, let name = item.studentName {
+        if let shown = captureShown, shown.id == id, capturedTogether <= 1, let name = item.studentName {
             captureShown?.pill = Pill(text: "✓ \(quiz(item.quizId)?.scoreText(item.answers) ?? "") · \(Self.short(name))", tone: .good)
             if Date().timeIntervalSince(shown.at) < 1.6 { setPill(captureShown!.pill) }
         }
@@ -319,12 +352,14 @@ final class ScanSession: ObservableObject {
         item.studentId = student?.id
         item.studentName = student?.name ?? item.read
         if item.period == nil { item.period = student?.period }
+        item.periodMismatch = mismatch(item)
         save(item)
     }
 
     func setPeriod(_ id: String, _ period: Int?) {
         guard var item = self.item(id) else { return }
         item.period = period
+        item.periodMismatch = mismatch(item)
         save(item)
     }
 
@@ -383,7 +418,7 @@ final class ScanSession: ObservableObject {
             let item = items.remove(at: i)
             drop(item)
             saveBatch()
-            if reviewId == id { reviewId = nextUnreviewed(after: i - 1) }
+            if reviewId == id { reviewId = (items.indices.first { $0 >= i && !items[$0].decided }.map { items[$0] } ?? items.first { !$0.decided })?.id }
         } else if let item = single, item.id == id {
             single = nil
             drop(item)
@@ -396,6 +431,8 @@ final class ScanSession: ObservableObject {
         fallbackNames[item.id] = nil
         fallbackPeriods[item.id] = nil
         periodStrips[item.id] = nil
+        fallbackDates[item.id] = nil
+        dateStrips[item.id] = nil
         if !item.processing { Task { await store.remove(item.id) } }
         if let photo = item.photo { Photos.remove(photo) }
     }
@@ -451,11 +488,12 @@ final class ScanSession: ObservableObject {
 
     // MARK: Review
 
-    var unreviewed: Int { items.filter { !$0.reviewed }.count }
+    var unreviewed: Int { items.filter { !$0.decided }.count }
+    var undecided: Int { unreviewed }
     var reviewItem: ScanItem? { reviewId.flatMap { id in items.first { $0.id == id } } }
 
     func openReview(at id: String? = nil) {
-        reviewId = id ?? items.first { !$0.reviewed }?.id
+        reviewId = id ?? items.first { !$0.decided }?.id
         showReview = true
         scanner.stop()
     }
@@ -468,13 +506,28 @@ final class ScanSession: ObservableObject {
     func approve(_ id: String) {
         guard let i = items.firstIndex(where: { $0.id == id }) else { return }
         items[i].reviewed = true
+        items[i].rejected = false
         saveBatch()
-        reviewId = nextUnreviewed(after: i)
     }
 
-    private func nextUnreviewed(after i: Int) -> String? {
-        let later = items.indices.filter { $0 > i && !items[$0].reviewed }
-        return (later.first.map { items[$0] } ?? items.first { !$0.reviewed })?.id
+    /// Rejected in review: it stays (dimmed, with Undo) until the batch is finished, then it's deleted.
+    func reject(_ id: String) {
+        guard let i = items.firstIndex(where: { $0.id == id }) else { return }
+        items[i].rejected = true
+        items[i].reviewed = false
+        saveBatch()
+    }
+
+    func unreject(_ id: String) {
+        guard let i = items.firstIndex(where: { $0.id == id }) else { return }
+        items[i].rejected = false
+        saveBatch()
+    }
+
+    /// The next sheet after `id` that hasn't been approved or rejected, wrapping around.
+    func nextUndecided(after id: String) -> String? {
+        let i = items.firstIndex { $0.id == id } ?? -1
+        return (items.indices.filter { $0 > i && !items[$0].decided }.first.map { items[$0] } ?? items.first { !$0.decided })?.id
     }
 
     /// Rescans one batch item: the camera captures just that test once, and the new scan takes its place.
@@ -504,9 +557,17 @@ final class ScanSession: ObservableObject {
         return percents.isEmpty ? nil : percents.reduce(0, +) / Double(percents.count)
     }
 
-    /// Clears the batch after review; uploads keep going.
+    /// Ends the batch after review: rejected sheets are deleted, the rest stay saved (their uploads keep going).
     func finishBatch() {
-        for item in items { release(item) }
+        for item in items { if item.rejected { drop(item) } else { release(item) } }
+        items = []
+        reviewId = nil
+        saveBatch()
+    }
+
+    /// Throws the whole batch away: every sheet in it is deleted, here and in the portal.
+    func discardBatch() {
+        for item in items { drop(item) }
         items = []
         reviewId = nil
         saveBatch()

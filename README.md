@@ -35,19 +35,22 @@ Scan paper tests with an iPhone, grade them automatically, and move the scores i
 - **Copy image** pastes the answer box into your own test document.
 
 ## Grading a stack
-1. Open the app on the **Scan** tab and choose **Batch** (a stack) or **Single** (one sheet) at the bottom.
+1. Open the app on the **Scan** tab and choose **Batch** or **Single** at the bottom. In Batch you can lay several sheets out and scan them all at once.
 2. Hold the phone over a sheet. The outline fills in as it locks on; when it's steady it buzzes once and shows the score. A sheet is captured once: it won't capture again until that sheet is out of view or a different one is under the camera.
-3. **Batch:** put the next sheet down; the tray counts them. Tap **Done** to review one sheet at a time: **Approve**, **Rescan** (captures just that sheet again), or delete.
+3. **Batch:** put the next sheets down; the tray counts them. Tap **Review** (or a thumbnail) and swipe through the sheets: **Approve**, **Reject** (instant; swipe back to undo), or **Rescan**. Rejected sheets are deleted when you finish. The **×** in the tray discards the whole batch.
 4. **Single:** the result opens right away with **Rescan** or **Next sheet**.
 5. On each sheet photo the phone draws a ✓ or ✗ by every number, so you can copy them onto the paper. Rows it couldn't call are outlined with an amber dot; tap **Right** or **Wrong** and the mark on the photo updates. **Undo** takes it back.
 6. The name is matched to your class list even when the handwriting reads a little off ("roah Sim" is Noah Kim). A clear match is filled in; a likely one asks you to confirm with one tap.
 7. If a student ends up with two scans for a test, nothing is replaced: both sheets show side by side with the differences outlined, and you keep one.
 8. Scores upload as soon as each sheet is read. The portal shows the same photos, marks and decisions, and you can settle rows there too.
 
+## Settings
+The gear on the Scan tab: your account and Sign out, which mode scanning starts in, the test ZipGrade sheets go to, and **Import from Jupiter**: take a photo of a class page in Jupiter (or pick a screenshot) and the names are added to the period you choose. Tests reload and uploads retry on their own.
+
 ## ZipGrade sheets
 The phone also reads ZipGrade's standard 20-question form (the free one from zipgrade.com), printed at any size.
 - The first time a ZipGrade sheet is under the camera, pick which test it's for (or create one with its answer key). ZipGrade sheets go to that test until you change it: tap **ZipGrade · test name** above the status.
-- It reads the handwritten name and the handwritten period digit, and the bubbles with the same rules as ours.
+- It reads the handwritten name, period and date, and the bubbles with the same rules as ours. The date shows next to the score, so a make-up test is easy to spot. If the period on the sheet isn't the student's period on your class list, the scan is flagged.
 - ZipGrade's Test Version bubbles aren't used; every sheet is graded with the test's one answer key.
 
 ## How the phone reads marks

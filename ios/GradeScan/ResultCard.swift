@@ -18,6 +18,7 @@ struct CardData {
     var rows: [Int: RowReview] = [:]  // rows to check, and ones already settled (shown with Undo)
     var duplicate = false             // the student already has another scan for this test: compare and keep one
     var layout: SheetLayout?          // the photo's sheet when it isn't the test's own (a ZipGrade form)
+    var takenOn: String?              // the date the student wrote on the sheet
 }
 
 /// One scanned sheet: the photo with its ✓ and ✗, who it is and the score, and any rows waiting for the teacher.
@@ -103,6 +104,10 @@ struct ResultCard: View {
                     } label: {
                         Text(data.period.map { "Period \($0)" } ?? "No period").foregroundStyle(data.period == nil ? Brand.warn : .secondary)
                     }
+                    if let date = data.takenOn {
+                        Text("·")
+                        Text(date)
+                    }
                 }
                 .font(.subheadline).foregroundStyle(.secondary)
             }
@@ -161,11 +166,12 @@ struct ResultCard: View {
                 (Text("Question \(q + 1)").fontWeight(.semibold) + Text("  \(describe(row)) · answer \(String(key))").foregroundStyle(.secondary))
                     .font(.subheadline)
                 HStack(spacing: 10) {
-                    Button { settle(q, key) } label: { Label("Right", systemImage: "checkmark").frame(maxWidth: .infinity) }
-                    Button { settle(q, Character(Review.noCredit(row, key: key))) } label: { Label("Wrong", systemImage: "xmark").frame(maxWidth: .infinity) }
+                    Button { settle(q, key) } label: { Label("Right", systemImage: "checkmark").fontWeight(.semibold).frame(maxWidth: .infinity) }
+                        .tint(Brand.good)
+                    Button { settle(q, Character(Review.noCredit(row, key: key))) } label: { Label("Wrong", systemImage: "xmark").fontWeight(.semibold).frame(maxWidth: .infinity) }
+                        .tint(Brand.bad)
                 }
                 .buttonStyle(.bordered)
-                .tint(.primary)
             }
         }
     }
@@ -255,7 +261,8 @@ struct ItemCard: View {
         ResultCard(data: CardData(quiz: scan.quiz(item.quizId), answers: item.answers, period: item.period, studentId: item.studentId,
                                   studentName: item.studentName, read: item.read, nameImage: item.nameImage, localPhoto: item.photo,
                                   processing: item.processing, notes: scan.notes(item), suggestion: scan.student(item.suggestedId),
-                                  rows: item.rows, duplicate: item.duplicateOf != nil, layout: item.layout(scan.quiz(item.quizId))),
+                                  rows: item.rows, duplicate: item.duplicateOf != nil, layout: item.layout(scan.quiz(item.quizId)),
+                                  takenOn: item.takenOn),
                    assign: { scan.assign(item.id, to: $0) },
                    setPeriod: { scan.setPeriod(item.id, $0) },
                    settle: { scan.settle(item.id, question: $0, answer: $1) },
@@ -291,7 +298,10 @@ struct ItemCardSheet: View {
             .safeAreaInset(edge: .bottom) {
                 if scan.item(id) != nil {
                     HStack(spacing: 10) {
-                        Button(role: .destructive) { confirmDiscard = true } label: {
+                        Button(role: .destructive) {
+                            scan.discard(id)
+                            if isSingle { scan.nextSheet() } else { dismiss() }
+                        } label: {
                             Image(systemName: "trash").frame(width: 28)
                         }
                         .buttonStyle(.bordered)

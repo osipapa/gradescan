@@ -12,6 +12,7 @@ struct Session: Codable, Sendable {
     var refreshToken: String
     var userId: String
     var expiresAt: Date
+    var email: String?
 }
 
 /// A test as created in the portal. `layout` says where everything is printed on its answer sheet.
@@ -55,6 +56,7 @@ struct ScanUpload: Codable, Sendable, Identifiable {
     let scannedAt: Date
     var review: [String: RowReview]?   // rows waiting for (or settled by) the teacher, by question index
     var form: String?          // the sheet it was read from: nil = the test's own sheet, "zipgrade20" = ZipGrade's form
+    var takenOn: String?       // the date the student wrote on the sheet, as read
 }
 
 /// Fields the teacher can fix after a scan.
@@ -90,6 +92,7 @@ struct ScanRecord: Codable, Identifiable, Sendable, Equatable {
     let photoPath: String?
     var review: [String: RowReview]?
     var form: String?
+    var takenOn: String?
 
     /// Where the photo's bubbles are: ZipGrade's form, or the test's own sheet.
     func layout(_ quiz: Quiz) -> SheetLayout? { form == SheetKind.zipgrade20.rawValue ? ZipGrade.form20 : quiz.layout }
@@ -100,7 +103,7 @@ extension ScanRecord {
     init(_ upload: ScanUpload) {
         self.init(id: upload.id, quizId: upload.quizId, period: upload.period, studentId: upload.studentId, studentName: upload.studentName,
                   nameImage: upload.nameImage, answers: upload.answers, scoreOverride: nil, scannedAt: upload.scannedAt, photoPath: upload.photoPath,
-                  review: upload.review, form: upload.form)
+                  review: upload.review, form: upload.form, takenOn: upload.takenOn)
     }
 }
 
@@ -187,9 +190,17 @@ enum API {
         return try decoder.decode([Student].self, from: data)
     }
 
+    /// Adds students to the class list; returns them as saved.
+    static func addStudents(_ list: [(name: String, period: Int?)], _ token: String) async throws -> [Student] {
+        struct Row: Encodable { let name: String; let period: Int? }
+        let data = try await request("/rest/v1/students?select=id,name,period,number", method: "POST", token: token,
+                                     body: try encoder.encode(list.map { Row(name: $0.name, period: $0.period) }), prefer: "return=representation")
+        return try decoder.decode([Student].self, from: data)
+    }
+
     /// A test's scans, newest first.
     static func scans(_ quizId: String, _ token: String) async throws -> [ScanRecord] {
-        let data = try await request("/rest/v1/scans?quiz_id=eq.\(quizId)&select=id,quiz_id,period,student_id,student_name,name_image,answers,score_override,scanned_at,photo_path,review,form&order=scanned_at.desc", token: token)
+        let data = try await request("/rest/v1/scans?quiz_id=eq.\(quizId)&select=id,quiz_id,period,student_id,student_name,name_image,answers,score_override,scanned_at,photo_path,review,form,taken_on&order=scanned_at.desc", token: token)
         return try decoder.decode([ScanRecord].self, from: data)
     }
 
@@ -237,7 +248,7 @@ enum API {
     }
 
     static func scan(_ id: String, _ token: String) async throws -> ScanRecord? {
-        let data = try await request("/rest/v1/scans?id=eq.\(id)&select=id,quiz_id,period,student_id,student_name,name_image,answers,score_override,scanned_at,photo_path,review,form", token: token)
+        let data = try await request("/rest/v1/scans?id=eq.\(id)&select=id,quiz_id,period,student_id,student_name,name_image,answers,score_override,scanned_at,photo_path,review,form,taken_on", token: token)
         return try decoder.decode([ScanRecord].self, from: data).first
     }
 

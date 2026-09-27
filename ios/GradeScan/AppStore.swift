@@ -40,7 +40,8 @@ final class AppStore: ObservableObject {
     func signIn(email: String, password: String) async {
         problem = nil
         do {
-            let s = try await API.signIn(email: email.trimmingCharacters(in: .whitespaces), password: password)
+            var s = try await API.signIn(email: email.trimmingCharacters(in: .whitespaces), password: password)
+            s.email = email.trimmingCharacters(in: .whitespaces)
             Keychain.set("session", try? JSONEncoder().encode(s))
             session = s
         } catch {
@@ -60,7 +61,9 @@ final class AppStore: ObservableObject {
         guard var s = session else { throw APIError(status: 401, message: "Signed out") }
         if s.expiresAt < Date().addingTimeInterval(60) {
             do {
+                let email = s.email
                 s = try await API.refresh(s.refreshToken)
+                s.email = email
             } catch let e as APIError where (400..<500).contains(e.status) {
                 signOut()
                 throw e
@@ -132,6 +135,31 @@ final class AppStore: ObservableObject {
     func photo(_ path: String) async -> UIImage? {
         guard let token = try? await validToken(), let data = try? await API.photo(path, token) else { return nil }
         return UIImage(data: data)
+    }
+
+    /// Keeps the app current on its own: retries uploads every half minute while any are waiting.
+    func keepSending() async {
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(30))
+            if !pending.isEmpty { await send() }
+        }
+    }
+
+    // MARK: Class list
+
+    /// Adds students (skipping anyone already on the list for that period). Returns how many were added.
+    func addStudents(_ list: [(name: String, period: Int?)]) async -> Int {
+        let known = Set(students.map { NameMatch.tokens($0.name).sorted().joined(separator: " ") + "|\($0.period ?? 0)" })
+        let new = list.filter { !known.contains(NameMatch.tokens($0.name).sorted().joined(separator: " ") + "|\($0.period ?? 0)") }
+        guard !new.isEmpty else { return 0 }
+        do {
+            let added = try await API.addStudents(new, try await validToken())
+            students = (students + added).sorted { $0.name < $1.name }
+            return added.count
+        } catch {
+            problem = error.localizedDescription
+            return 0
+        }
     }
 
     // MARK: Uploads

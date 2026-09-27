@@ -724,7 +724,7 @@ async function showTest(id) {
 }
 
 async function refresh(q, force = false) {
-  const { data, error } = await sb.from('scans').select('id,period,student_id,student_name,name_image,student_code,answers,score_override,scanned_at,review,photo_path,form')
+  const { data, error } = await sb.from('scans').select('id,period,student_id,student_name,name_image,student_code,answers,score_override,scanned_at,review,photo_path,form,taken_on')
     .eq('quiz_id', q.id).order('scanned_at', { ascending: false });
   if (!$('#results')) return;
   if (error) { $('#results').innerHTML = `<p class="err pad">${esc(error.message)}</p>`; return; }
@@ -871,7 +871,7 @@ function rowsOf(q) {
     return { s, g, st, checks: reviewRows(q, s), final: Number(s.score_override ?? g.score), name: st?.name || s.student_name || (s.student_code ? `Student #${s.student_code}` : '') };
   }).sort((a, b) => (a.s.period ?? 99) - (b.s.period ?? 99) || a.name.localeCompare(b.name));
 }
-const needsReview = r => !r.st || r.checks.some(c => c.result == null);
+const needsReview = r => !r.st || r.checks.some(c => c.result == null) || (r.s.period && r.st.period && r.s.period !== r.st.period);
 
 // A student's period comes from the class list; a scan's own period is only used when no student is assigned.
 const periodOf = r => r.st?.period ?? r.s.period ?? null;
@@ -904,7 +904,7 @@ function renderResults(q) {
     const read = r.s.student_name ? ` <span class="muted sm">read “${esc(r.s.student_name)}”</span>` : '';
     overlays.set(r.s.id, open ? marksSvg(q, r.s, r.checks) + highlightSvg(q, r) : '');
     return `<tr class="res${open ? ' open' : ''}" data-row="${r.s.id}">
-      <td class="student">${r.st ? `<span class="strong">${esc(r.st.name)}</span>` : `<span class="strong unsure">${sug ? `${esc(sug.name)}?` : 'Who is this?'}</span>${read}`}</td>
+      <td class="student">${r.st ? `<span class="strong">${esc(r.st.name)}</span>` : `<span class="strong unsure">${sug ? `${esc(sug.name)}?` : 'Who is this?'}</span>${read}`}${r.s.taken_on ? ` <span class="muted sm">${esc(r.s.taken_on)}</span>` : ''}</td>
       <td class="num">${waiting.length || !r.st ? `<span class="flag" title="${waiting.length ? `${waiting.length} to check` : 'Who is this?'}" aria-label="Needs a look"></span>` : ''}<button class="scorebtn" data-score="${r.s.id}" title="Click to change the score"><span class="strong">${fmt(r.final)}</span><span class="muted"> / ${fmt(max)}</span></button>
         <span class="muted sm pct">${pct(r.final, max)}%</span>
         ${edited ? `<div class="muted sm">edited · <a href="#" data-reset="${r.s.id}">reset</a></div>` : ''}</td>
@@ -915,7 +915,8 @@ function renderResults(q) {
         <div class="side-q">
           <div class="ask">
             ${r.s.name_image ? `<img class="hand" src="${esc(r.s.name_image)}" alt="Handwritten name">` : ''}
-            ${r.st ? `<p><span class="strong">${esc(r.st.name)}</span>${periodOf(r) ? ` <span class="muted sm">Period ${periodOf(r)}</span>` : ''} · <a href="#" data-change="${r.s.id}">Change</a></p>`
+            ${r.st ? `<p><span class="strong">${esc(r.st.name)}</span>${periodOf(r) ? ` <span class="muted sm">Period ${periodOf(r)}</span>` : ''} · <a href="#" data-change="${r.s.id}">Change</a></p>
+              ${r.s.period && r.st.period && r.s.period !== r.st.period ? `<p class="muted sm">Period ${r.s.period} on the sheet, but the class list says ${r.st.period}.</p>` : ''}`
               : sug ? `<p>Is this <span class="strong">${esc(sug.name)}</span>?</p><div class="answer"><button class="btn sm outline" data-yes="${r.s.id}" data-st="${sug.id}">Yes</button><button class="btn sm ghost" data-change="${r.s.id}">Someone else</button></div>`
               : `<p>Who is this?</p>`}
             <select class="input" data-stud="${r.s.id}" aria-label="Student"${r.st || sug ? ' hidden' : ''}><option value="">Choose a student</option>${(pool.length ? pool : students).map(x => `<option value="${x.id}" ${x.id === r.s.student_id ? 'selected' : ''}>${esc(x.name)}${x.period ? ` · P${x.period}` : ''}</option>`).join('')}</select>

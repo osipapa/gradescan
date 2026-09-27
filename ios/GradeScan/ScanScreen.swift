@@ -4,6 +4,8 @@ import SwiftUI
 struct ScanScreen: View {
     @EnvironmentObject var store: AppStore
     @EnvironmentObject var scan: ScanSession
+    @State private var showSettings = false
+    @State private var confirmDiscardBatch = false
 
     var body: some View {
         ZStack {
@@ -26,12 +28,9 @@ struct ScanScreen: View {
                     .glassCapsule()
                 }
                 pill
-                if let problem = store.problem {
-                    Button { Task { await store.send() } } label: {
-                        Label("\(problem) Retry", systemImage: "exclamationmark.triangle.fill").font(.footnote).lineLimit(2)
-                    }
-                    .foregroundStyle(.orange)
-                    .padding(.horizontal, 16).padding(.vertical, 10).glassCapsule()
+                if store.problem != nil && !store.pending.isEmpty {
+                    Text("\(store.pending.count) waiting to upload. It keeps trying.").font(.footnote).foregroundStyle(.white.opacity(0.85))
+                        .padding(.horizontal, 14).padding(.vertical, 8).glassCapsule()
                 } else if !store.pending.isEmpty {
                     Text("Uploading \(store.pending.count)…").font(.footnote).foregroundStyle(.white.opacity(0.85))
                 }
@@ -46,6 +45,12 @@ struct ScanScreen: View {
         }
         .sheet(item: $scan.card, onDismiss: scan.cardDismissed) { ref in
             ItemCardSheet(id: ref.id).environmentObject(store).environmentObject(scan)
+        }
+        .sheet(isPresented: $showSettings) { SettingsView().environmentObject(store).environmentObject(scan) }
+        .confirmationDialog("Discard this batch?", isPresented: $confirmDiscardBatch, titleVisibility: .visible) {
+            Button("Discard \(scan.items.count) scans", role: .destructive) { scan.discardBatch() }
+        } message: {
+            Text("They're deleted here and in the portal.")
         }
         .sheet(isPresented: $scan.askZipGrade, onDismiss: { if scan.askZipGrade == false && scan.zipgradeQuizId == nil { scan.zipgradeAskDismissed() } }) {
             ZipGradeTestPicker().environmentObject(store).environmentObject(scan)
@@ -74,15 +79,11 @@ struct ScanScreen: View {
             .glassCapsule()
             .accessibilityLabel(scan.torch ? "Turn flashlight off" : "Turn flashlight on")
             Spacer()
-            Menu {
-                Button("Reload tests", systemImage: "arrow.clockwise") { Task { await store.reload() } }
-                Button("Retry uploads", systemImage: "arrow.up.circle") { Task { await store.send() } }
-                Button("Sign out", systemImage: "rectangle.portrait.and.arrow.right", role: .destructive) { store.signOut() }
-            } label: {
-                Image(systemName: "ellipsis").font(.title3).frame(width: 46, height: 46)
+            Button { showSettings = true } label: {
+                Image(systemName: "gearshape").font(.title3).frame(width: 46, height: 46)
             }
             .glassCapsule()
-            .accessibilityLabel("More")
+            .accessibilityLabel("Settings")
         }
         .foregroundStyle(.white)
     }
@@ -131,13 +132,18 @@ struct ScanScreen: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.vertical, 8)
             } else {
+                Button { confirmDiscardBatch = true } label: {
+                    Image(systemName: "xmark").font(.subheadline.weight(.semibold)).frame(width: 30, height: 44)
+                }
+                .foregroundStyle(.white.opacity(0.85))
+                .accessibilityLabel("Discard batch")
                 ForEach(scan.items.suffix(4)) { item in
-                    Button { scan.openCard(item.id) } label: { Thumb(item: item) }
+                    Button { scan.openReview(at: item.id) } label: { Thumb(item: item) }
                 }
                 Text("\(scan.items.count)").font(.headline.monospacedDigit()).foregroundStyle(.white).padding(.leading, 2)
                 Spacer()
                 Button { scan.openReview() } label: {
-                    Text("Done").font(.headline).padding(.horizontal, 22).padding(.vertical, 11)
+                    Text("Review").font(.headline).padding(.horizontal, 22).padding(.vertical, 11)
                 }
                 .background(Brand.sage, in: Capsule())
                 .foregroundStyle(Brand.ink)

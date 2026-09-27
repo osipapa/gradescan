@@ -1,15 +1,24 @@
 import Accelerate
 import CoreGraphics
 
-/// Finds an answer sheet by its five solid black squares (four corners, plus one on the left edge that tells up
-/// from down). Works for every test: positions are measured between the corner squares' centers, so (0, 0) is the
-/// top-left square, (1, 1) the bottom-right one, and the edge square sits at (0, 0.35).
-/// Works on a one-third-size copy of the camera's luma plane. Use one finder per queue; it reuses its buffers.
+/// A sheet found in an image: its corner squares' centers in normalized image coordinates (top-left, top-right,
+/// bottom-right, bottom-left) and its kind.
+struct FoundSheet {
+    let corners: [CGPoint]
+    let kind: SheetKind
+    var center: CGPoint { CGPoint(x: corners.reduce(0) { $0 + $1.x } / 4, y: corners.reduce(0) { $0 + $1.y } / 4) }
+}
+
+/// Finds answer sheets by their solid black squares: four corners plus extra squares on the edges that tell up from
+/// down and which kind of sheet it is (see `SheetKind.markers`). Positions are measured between the corner squares'
+/// centers, so (0, 0) is the top-left square and (1, 1) the bottom-right one. Several sheets laid out side by side
+/// are all found. Works on a small copy of the camera's luma plane. Use one finder per queue; it reuses its buffers.
 final class BoxFinder {
     private struct Blob {
         let x: Double      // centroid in downscaled pixels
         let y: Double
         let side: Double   // square root of the area
+        let shape: Double  // area over the squared distance to the farthest pixel: about 1.8 for a square, 2.4+ for a filled bubble
     }
 
     private var factor = 3   // about 640 pixels across after downscaling, whatever the camera gives
@@ -24,14 +33,29 @@ final class BoxFinder {
     static let unitCorners = [CGPoint(x: 0, y: 0), CGPoint(x: 1, y: 0), CGPoint(x: 1, y: 1), CGPoint(x: 0, y: 1)]
     static let unitMarker = CGPoint(x: 0, y: 0.35)
 
-    /// Centers of the corner squares in normalized image coordinates (top-left, top-right, bottom-right, bottom-left),
-    /// and which kind of sheet they belong to (ours, or a ZipGrade form), told apart by where the extra squares are.
-    func find(_ image: LumaImage) -> (corners: [CGPoint], kind: SheetKind)? {
-        guard downscale(image) else { return nil }
+    /// The one sheet nearest the middle of the frame. `accept` confirms a candidate is a real sheet (for ours, that
+    /// its test code reads); filled bubbles can line up like squares, so unconfirmed candidates are passed over.
+    func find(_ image: LumaImage, accept: (FoundSheet) -> Bool = { _ in true }) -> (corners: [CGPoint], kind: SheetKind)? {
+        findAll(image, limit: 1, preferMiddle: true, accept: accept).first.map { ($0.corners, $0.kind) }
+    }
+
+    /// Every sheet in the frame (up to `limit`), best-fitting first, each confirmed by `accept`.
+    func findAll(_ image: LumaImage, limit: Int = 8, preferMiddle: Bool = false, accept: (FoundSheet) -> Bool = { _ in true }) -> [FoundSheet] {
+        guard downscale(image) else { return [] }
         let blobs = squares()
-        guard blobs.count >= 5, let fit = bestFit(blobs) else { return nil }
+        guard blobs.count >= 5 else { return [] }
         let f = Double(factor), w = Double(image.width), h = Double(image.height)
-        return (fit.corners.map { CGPoint(x: (f * $0.x + f / 2) / w, y: (f * $0.y + f / 2) / h) }, fit.kind)
+        var used = Set<Int>(), out: [FoundSheet] = []
+        for fit in fits(blobs, preferMiddle: preferMiddle) where out.count < limit {
+            let parts = fit.corners + fit.markers
+            guard parts.allSatisfy({ !used.contains($0) }) else { continue }
+            let sheet = FoundSheet(corners: fit.corners.map { CGPoint(x: (f * blobs[$0].x + f / 2) / w, y: (f * blobs[$0].y + f / 2) / h) },
+                                   kind: fit.kind)
+            guard accept(sheet) else { continue }
+            used.formUnion(parts)
+            out.append(sheet)
+        }
+        return out
     }
 
     private func downscale(_ image: LumaImage) -> Bool {
@@ -101,10 +125,10 @@ final class BoxFinder {
                                 reach2 = max(reach2, dx * dx + dy * dy)
                             }
                         }
-                        let reach = reach2.squareRoot() + 0.7
+                        let reach = reach2.squareRoot() + 0.5
                         let shape = Double(area) / (reach * reach)
                         guard shape > 1.5, shape < 2.6 else { continue }
-                        blobs.append(Blob(x: cx, y: cy, side: Double(area).squareRoot()))
+                        blobs.append(Blob(x: cx, y: cy, side: Double(area).squareRoot(), shape: shape))
                     }
                 }
             }
@@ -112,52 +136,82 @@ final class BoxFinder {
         return blobs
     }
 
-    /// The four corner squares, in top-left, top-right, bottom-right, bottom-left order, whose fitted sheet
-    /// puts the fifth square where the layout says. Prefers the sheet nearest the middle of the frame.
-    private func bestFit(_ blobs: [Blob]) -> (corners: [Blob], kind: SheetKind)? {
-        let cands = Array(blobs.sorted { $0.side > $1.side }.prefix(12)), n = cands.count
+    private struct Fit {
+        let score: Double
+        let corners: [Int]   // blob indices: top-left, top-right, bottom-right, bottom-left
+        let markers: [Int]
+        let kind: SheetKind
+    }
+
+    /// Every way four squares make a sheet whose extra squares are where its kind puts them, best first.
+    /// Each square is only tried with its nearest similar-sized neighbors, so many sheets in view stay fast.
+    private func fits(_ blobs: [Blob], preferMiddle: Bool) -> [Fit] {
+        // Corner and edge squares are square; filled bubbles, which can be the same size, are round.
+        let square: (Int) -> Bool = { blobs[$0].shape < 2.45 }
+        let cands = Array(blobs.indices.filter(square).sorted { blobs[$0].side > blobs[$1].side }.prefix(40))
         let sheet = Self.unitCorners
         let middle = CGPoint(x: Double(width) / 2, y: Double(height) / 2), diagonal = hypot(Double(width), Double(height))
-        var best: (score: Double, corners: [Blob], kind: SheetKind)?
-        for i in 0..<n { for j in i + 1 ..< n { for k in j + 1 ..< n { for l in k + 1 ..< n {
-            let quad = [cands[i], cands[j], cands[k], cands[l]]
-            let biggest = quad.map(\.side).max()!, smallest = quad.map(\.side).min()!
-            guard biggest <= 1.8 * smallest else { continue }
-            let mx = quad.reduce(0) { $0 + $1.x } / 4, my = quad.reduce(0) { $0 + $1.y } / 4
-            let ring = quad.sorted { atan2($0.y - my, $0.x - mx) < atan2($1.y - my, $1.x - mx) }   // clockwise on screen
-            guard area(ring) > 12 * biggest * biggest else { continue }
-            for turn in 0..<4 {
-                let corners = (0..<4).map { ring[($0 + turn) % 4] }
-                guard let map = Homography(sheet, corners.map { CGPoint(x: $0.x, y: $0.y) }) else { continue }
-                for kind in [SheetKind.gradescan, .zipgrade20] {
-                    // Each kind's squares are a set share of the width between the corner squares' centers
-                    // (ours 0.25 in over 3.3–3.9 in, ZipGrade's 0.17 in over 3.4 in). Page text and bubbles don't line up like that.
-                    let half = kind.squareHalf
-                    let sized = zip(sheet, corners).allSatisfy { point, blob in
-                        let a = map.apply(CGPoint(x: point.x - half, y: point.y)), b = map.apply(CGPoint(x: point.x + half, y: point.y))
-                        let expected = hypot(b.x - a.x, b.y - a.y)
-                        return blob.side > 0.6 * expected && blob.side < 1.6 * expected
-                    }
-                    guard sized else { continue }
-                    let expected = corners.reduce(0) { $0 + $1.side } / 4
-                    var total = 0.0, allFound = true
-                    for marker in kind.markers {
-                        let predicted = map.apply(marker)
-                        var miss = Double.infinity, found: Blob?
-                        for blob in blobs {
-                            let d = hypot(blob.x - predicted.x, blob.y - predicted.y)
-                            if d < miss { miss = d; found = blob }
+        let dist: (Int, Int) -> Double = { hypot(blobs[$0].x - blobs[$1].x, blobs[$0].y - blobs[$1].y) }
+        var seen = Set<[Int]>(), out: [Fit] = []
+        let similar: (Int, Int) -> Bool = { blobs[$0].side < 1.8 * blobs[$1].side && blobs[$1].side < 1.8 * blobs[$0].side }
+        for a in cands {
+            // Two nearby squares as the corners next to `a`; the fourth corner is looked for where they point
+            // (other sheets laid close by can be nearer than a sheet's own opposite corner).
+            let n = Array(cands.filter { $0 != a && similar(a, $0) }.sorted { dist(a, $0) < dist(a, $1) }.prefix(14))
+            for i in 0..<n.count { for j in i + 1 ..< n.count {
+                let b = blobs[n[i]], c = blobs[n[j]], ax = blobs[a].x, ay = blobs[a].y
+                let px = b.x + c.x - ax, py = b.y + c.y - ay
+                let reach = 0.3 * min(dist(a, n[i]), dist(a, n[j]))
+                guard let d = cands.filter({ $0 != a && $0 != n[i] && $0 != n[j] && similar(a, $0) })
+                        .min(by: { hypot(blobs[$0].x - px, blobs[$0].y - py) < hypot(blobs[$1].x - px, blobs[$1].y - py) }),
+                      hypot(blobs[d].x - px, blobs[d].y - py) < reach else { continue }
+                let key = [a, n[i], n[j], d].sorted()
+                guard seen.insert(key).inserted else { continue }
+                let quad = key.map { blobs[$0] }
+                let biggest = quad.map(\.side).max()!, smallest = quad.map(\.side).min()!
+                guard biggest <= 1.8 * smallest else { continue }
+                let mx = quad.reduce(0) { $0 + $1.x } / 4, my = quad.reduce(0) { $0 + $1.y } / 4
+                let order = key.indices.sorted { atan2(quad[$0].y - my, quad[$0].x - mx) < atan2(quad[$1].y - my, quad[$1].x - mx) }   // clockwise on screen
+                let ring = order.map { quad[$0] }, ids = order.map { key[$0] }
+                guard area(ring) > 12 * biggest * biggest else { continue }
+                // A sheet in perspective is still roughly a parallelogram: opposite sides of similar length.
+                let sides = (0..<4).map { hypot(ring[$0].x - ring[($0 + 1) % 4].x, ring[$0].y - ring[($0 + 1) % 4].y) }
+                guard sides[0] < 2 * sides[2], sides[2] < 2 * sides[0], sides[1] < 2 * sides[3], sides[3] < 2 * sides[1] else { continue }
+                for turn in 0..<4 {
+                    let corners = (0..<4).map { ring[($0 + turn) % 4] }, cornerIds = (0..<4).map { ids[($0 + turn) % 4] }
+                    guard let map = Homography(sheet, corners.map { CGPoint(x: $0.x, y: $0.y) }) else { continue }
+                    for kind in [SheetKind.gradescan, .zipgrade20] {
+                        // Each kind's squares are a set share of the width between the corner squares' centers
+                        // (ours 0.25 in over 3.3–3.9 in, ZipGrade's 0.17 in over 3.4 in). Page text and bubbles don't line up like that.
+                        let half = kind.squareHalf
+                        let sized = zip(sheet, corners).allSatisfy { point, blob in
+                            let a = map.apply(CGPoint(x: point.x - half, y: point.y)), b = map.apply(CGPoint(x: point.x + half, y: point.y))
+                            let expected = hypot(b.x - a.x, b.y - a.y)
+                            return blob.side > 0.6 * expected && blob.side < 1.6 * expected
                         }
-                        guard let found, miss < 0.4 * expected, found.side > 0.55 * expected, found.side < 1.8 * expected else { allFound = false; break }
-                        total += miss
+                        guard sized else { continue }
+                        let expected = corners.reduce(0) { $0 + $1.side } / 4
+                        var total = 0.0, markers: [Int] = []
+                        for marker in kind.markers {
+                            let predicted = map.apply(marker)
+                            var miss = Double.infinity, found: Int?
+                            for b in blobs.indices where square(b) {
+                                let d = hypot(blobs[b].x - predicted.x, blobs[b].y - predicted.y)
+                                if d < miss { miss = d; found = b }
+                            }
+                            guard let found, miss < 0.4 * expected, blobs[found].side > 0.55 * expected, blobs[found].side < 1.8 * expected else { break }
+                            total += miss
+                            markers.append(found)
+                        }
+                        guard markers.count == kind.markers.count else { continue }
+                        var score = total / Double(markers.count) / expected
+                        if preferMiddle { score += 0.3 * hypot(mx - middle.x, my - middle.y) / diagonal }
+                        out.append(Fit(score: score, corners: cornerIds, markers: markers, kind: kind))
                     }
-                    guard allFound else { continue }
-                    let score = total / Double(kind.markers.count) / expected + 0.3 * hypot(mx - middle.x, my - middle.y) / diagonal
-                    if score < best?.score ?? .infinity { best = (score, corners, kind) }
                 }
-            }
-        }}}}
-        return best.map { ($0.corners, $0.kind) }
+            }}
+        }
+        return out.sorted { $0.score < $1.score }
     }
 
     private func area(_ ring: [Blob]) -> Double {

@@ -16,6 +16,7 @@ struct SheetLayout: Codable, Sendable {
     let period: [[Double]]       // bubble centers for periods 1–9
     let name: [Double]           // handwritten name area: x, y, width, height
     var periodBox: [Double]? = nil   // a handwritten period box instead of bubbles (ZipGrade): x, y, width, height
+    var dateBox: [Double]? = nil     // a handwritten date box (ZipGrade): x, y, width, height
 
     var cornerPoints: [CGPoint] { corners.map(Self.point) }
 
@@ -232,7 +233,7 @@ enum Reader {
     }
 
     static func inspect(_ c: CGPoint, radius r: Double, _ img: LumaImage, _ h: Homography, arms armsRadii: [Double] = [1.35, 1.5],
-                        armsContrast: Double = inkContrast) -> Bubble {
+                        armsContrast: Double = inkContrast, thorough: Bool = true) -> Bubble {
         let luma: (Double, Double) -> Double? = { x, y in img.smooth(h.apply(CGPoint(x: c.x + r * x, y: c.y + r * y))) }
         let paper = ring.reduce(0.0) { max($0, luma($1.x, $1.y) ?? 0) }
         guard paper > 0 else { return .empty }
@@ -245,6 +246,8 @@ enum Reader {
             }
         }
         let coverage = Double(inside.count) / Double(disk.count)
+        // Video frames only need the gist: a clearly empty bubble skips the stroke checks (the photo does them all).
+        if !thorough && coverage < 0.05 { return Bubble(coverage: coverage, tone: 0, crossedOut: false, xMark: false, circled: false, arms: 0) }
         // Past the printed circle, far enough out that the circle itself doesn't show up when the sheet is a little
         // off. A fill that spills over leaves on one side; an X drawn over the bubble leaves in three or more
         // directions; a slash leaves on two opposite sides; a circle drawn around it is all around.
@@ -364,7 +367,7 @@ enum Reader {
         let bubbles: ([[Double]]) -> [Bubble] = { centers in
             centers.map(SheetLayout.point).map { c in
                 let d = fix(c)
-                return inspect(CGPoint(x: c.x + d.x, y: c.y + d.y), radius: r, img, h, arms: arms, armsContrast: armsContrast)
+                return inspect(CGPoint(x: c.x + d.x, y: c.y + d.y), radius: r, img, h, arms: arms, armsContrast: armsContrast, thorough: align)
             }
         }
         let p = rows[0].isEmpty ? -1 : choose(bubbles(rows[0]))

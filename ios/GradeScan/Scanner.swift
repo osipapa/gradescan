@@ -3,20 +3,26 @@ import UIKit
 
 enum ScanEvent {
     case cameraDenied
-    case frame(FrameInfo)     // every camera frame: what's in view, for the outline and the status
+    case frame(FrameInfo)     // every camera frame: the sheets in view, for the outlines and the status
     case captured(Capture)    // a sheet was captured (from the video, right away)
     case photo(PhotoResult)   // its full-resolution photo was read, a moment later
 }
 
-struct FrameInfo {
-    let quiz: Quiz?           // the sheet's test (nil: no sheet, or a sheet of an unknown test)
-    let map: Homography?      // sheet inches → image points; corner-to-corner units for an unknown test
-    var layout: SheetLayout?  // the sheet's layout, for the outline
-    let unknownTest: Bool
-    let wrongTest: Bool       // a known test, but not the one being rescanned
-    var zipgrade = false      // a ZipGrade form is in view
+/// One sheet in view, followed from frame to frame.
+struct SheetInView {
+    let track: Int            // the same number while the sheet stays in view
+    var quiz: Quiz?           // its test (nil: a sheet of an unknown test, or its code didn't read this frame)
+    var map: Homography?      // sheet inches → image points; corner-to-corner units when the layout isn't known
+    var layout: SheetLayout?
+    var unknownTest = false
+    var wrongTest = false     // a known test, but not the one being rescanned
+    var zipgrade = false      // a ZipGrade form
     var needsTest = false     // …and the teacher hasn't said which test ZipGrade sheets are for
-    let gate: GateOutput
+    var gate: GateOutput
+}
+
+struct FrameInfo {
+    let sheets: [SheetInView]
 }
 
 struct Capture {
@@ -29,20 +35,25 @@ struct Capture {
     let scannedAt: Date
     var kind: SheetKind = .gradescan
     var periodBox: GrayStrip?   // ZipGrade: the handwritten period, from the video frame
+    var dateBox: GrayStrip?     // ZipGrade: the handwritten date, from the video frame
+    var track = 0
+    var corners: [CGPoint] = []   // where it was in the video frame (normalized), to find it again in the photo
+    var videoAspect = 16.0 / 9
 }
 
 struct PhotoResult {
     let id: String
-    let answers: String?      // the photo's reading merged with the video's; nil if the photo couldn't be read
+    let answers: String?      // the photo's reading; nil if the photo couldn't be read
     let period: Int?
     let name: GrayStrip?
     let jpeg: Data?           // the straightened sheet (no marks; the apps draw them)
     var rows: [Int: RowReview] = [:]   // rows left for the teacher to check
     var periodBox: GrayStrip?          // ZipGrade: the handwritten period, from the photo
+    var dateBox: GrayStrip?            // ZipGrade: the handwritten date, from the photo
 }
 
-/// Runs the camera, finds an answer sheet by its black squares, reads it, and captures it once when it's steady.
-/// Every mutable property is only touched on `queue`, which is what makes `@unchecked Sendable` safe here.
+/// Runs the camera, finds answer sheets by their black squares (several at once), reads them, and captures each one
+/// once when it's steady. Every mutable property is only touched on `queue`, which is what makes `@unchecked Sendable` safe.
 final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @unchecked Sendable {
     let session = AVCaptureSession()
     /// Set once before `start()`. Called on the scanner queue.
@@ -61,10 +72,21 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
     private let photoOutput = AVCapturePhotoOutput()
     private let photoFinder = BoxFinder()           // only used on photoQueue
     private var photoJobs: [Int64: PhotoJob] = [:]
-    private var lastCorners: [CGPoint] = []
-    private var lastCode: Int?
-    private var lastNumber: Int?
-    private var gate = CaptureGate()
+
+    /// A sheet followed from frame to frame, with its own capture gate, so each sheet in view is captured once.
+    private struct Track {
+        let id: Int
+        var corners: [CGPoint]
+        var gate = CaptureGate()
+        var lastSeen: TimeInterval
+        var lastCode: Int?
+        var lastNumber: Int?
+        var center: CGPoint { CGPoint(x: corners.reduce(0) { $0 + $1.x } / 4, y: corners.reduce(0) { $0 + $1.y } / 4) }
+    }
+    private var tracks: [Track] = []
+    private var nextTrack = 1
+    private var single = false      // one sheet at a time, and scanning waits after each capture
+    private var paused = false      // single mode: waiting for the teacher after a capture
     private var expected: String?   // during a rescan, the only test that may be captured
     private var zipgradeQuiz: Quiz?   // the test ZipGrade sheets are for (they carry no test code)
     private var held = false        // frames are ignored, e.g. while a card is open over the camera
@@ -74,19 +96,30 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
         queue.async { self.tests = byCode }
     }
 
-    /// Single mode pauses after each capture; `expect` limits captures to one test (rescans).
+    /// Single mode captures one sheet and waits; batch mode captures every sheet in view. `expect` limits captures to
+    /// one test (rescans).
     func configure(single: Bool, expect quizId: String?) {
         queue.async {
-            self.gate.pausesAfterCapture = single
+            self.single = single
             self.expected = quizId
         }
     }
 
-    /// Ready to capture whatever is in view, even the sheet that was just captured.
-    func reset() { queue.async { self.gate.reset() } }
+    /// Ready to capture whatever is in view, even sheets that were just captured.
+    func reset() {
+        queue.async {
+            self.tracks = []
+            self.paused = false
+        }
+    }
 
-    /// Continue after a pause: `rescan` captures the sheet in view again; otherwise wait for the next sheet.
-    func resume(rescan: Bool) { queue.async { self.gate.resume(rescan: rescan) } }
+    /// Continue after a pause: `rescan` captures the sheets in view again; otherwise wait for the next sheet.
+    func resume(rescan: Bool) {
+        queue.async {
+            self.paused = false
+            for i in self.tracks.indices { self.tracks[i].gate.resume(rescan: rescan) }
+        }
+    }
 
     func hold(_ on: Bool) { queue.async { self.held = on } }
 
@@ -189,7 +222,7 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard !held, let pixels = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        guard !held, !paused, let pixels = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
         CVPixelBufferLockBaseAddress(pixels, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixels, .readOnly) }
@@ -198,150 +231,203 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
                               width: CVPixelBufferGetWidthOfPlane(pixels, 0),
                               height: CVPixelBufferGetHeightOfPlane(pixels, 0),
                               bytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(pixels, 0))
-        let nothing = GateFrame(time: time, sheet: nil)
-        guard let found = finder.find(image), let unit = Homography(BoxFinder.unitCorners, found.corners) else {
-            lastCorners = []
-            emit(nil, nil, gate.step(nothing))
-            return
+        // A candidate of ours is a real sheet if its test code reads (or it sits where a sheet with a code was a moment
+        // ago and the code blurred for a frame). ZipGrade's six squares don't happen by chance.
+        let accept: (FoundSheet) -> Bool = { sheet in
+            guard sheet.kind == .gradescan else { return true }
+            if let unit = Homography(BoxFinder.unitCorners, sheet.corners), Reader.testCode(image, unit) != nil { return true }
+            let c = sheet.center
+            return self.tracks.contains { $0.lastCode != nil && hypot($0.center.x - c.x, $0.center.y - c.y) < 0.03 }
         }
-        let corners = found.corners
-        if found.kind == .zipgrade20 {
-            readZipGrade(image, corners, unit, time)
-            return
+        // Single mode follows the sheet nearest the middle; batch mode every sheet laid out in view.
+        let sheets = single ? finder.find(image, accept: accept).map { [FoundSheet(corners: $0.corners, kind: $0.kind)] } ?? []
+                            : finder.findAll(image, limit: 6, accept: accept)
+
+        // Match each sheet to the track it was in the frames before (by where its middle is); new sheets get a track.
+        var free = Set(tracks.indices), matched: [(Int, FoundSheet)] = []
+        for sheet in sheets {
+            let c = sheet.center
+            let near = free.min { hypot(tracks[$0].center.x - c.x, tracks[$0].center.y - c.y) < hypot(tracks[$1].center.x - c.x, tracks[$1].center.y - c.y) }
+            if let t = near, hypot(tracks[t].center.x - c.x, tracks[t].center.y - c.y) < 0.12 {
+                free.remove(t)
+                matched.append((t, sheet))
+            } else {
+                tracks.append(Track(id: nextTrack, corners: sheet.corners, lastSeen: time))
+                nextTrack += 1
+                matched.append((tracks.count - 1, sheet))
+            }
         }
+        // A sheet that isn't in view: its gate hears "no sheet" (and re-arms once it's been gone a moment).
+        for t in free { _ = tracks[t].gate.step(GateFrame(time: time, sheet: nil)) }
+
+        var infos: [SheetInView] = [], captures: [Capture] = []
+        for (t, sheet) in matched {
+            let (info, capture) = follow(t, sheet, image, time)
+            infos.append(info)
+            if var capture {
+                capture.videoAspect = Double(image.width) / Double(image.height)
+                captures.append(capture)
+            }
+        }
+        tracks.removeAll { time - $0.lastSeen > 1.5 }
+        onEvent?(.frame(FrameInfo(sheets: infos)))
+        if !captures.isEmpty {
+            for capture in captures { onEvent?(.captured(capture)) }
+            takePhoto(captures)
+            if single { paused = true }
+        }
+    }
+
+    /// Reads one sheet in view and steps its gate. Returns what to show for it, and a capture when the gate fires.
+    private func follow(_ t: Int, _ sheet: FoundSheet, _ image: LumaImage, _ time: TimeInterval) -> (SheetInView, Capture?) {
+        var track = tracks[t]
+        defer { tracks[t] = track }
+        let corners = sheet.corners, nothing = GateFrame(time: time, sheet: nil)
         // The printed codes can blur for a frame; a sheet that hasn't moved keeps the codes it had.
-        let steady = lastCorners.count == 4 && zip(corners, lastCorners).allSatisfy { hypot($0.x - $1.x, $0.y - $1.y) < 0.02 }
-        lastCorners = corners
-        guard let code = Reader.testCode(image, unit) ?? (steady ? lastCode : nil) else {
-            lastCode = nil
-            emit(nil, nil, gate.step(nothing))
-            return
-        }
-        lastCode = code
-        guard let quiz = tests[code], let layout = quiz.layout, let map = Homography(layout.cornerPoints, corners) else {
-            emit(nil, unit, gate.step(nothing), unknown: true)
-            return
-        }
-        if let expected, quiz.id != expected {
-            emit(quiz, map, gate.step(nothing), wrong: true)
-            return
-        }
-        let number = Reader.studentNumber(image, unit) ?? (steady ? lastNumber : nil)
-        lastNumber = number
-        let read = Reader.read(quiz, layout, image, map)
-        let out = gate.step(GateFrame(time: time, sheet: SheetRead(corners: corners, identity: "\(quiz.id)|\(number ?? 0)",
-                                                                  period: read.period, answers: read.answers)))
-        if case .fire(let period, let answers) = out {
-            let capture = Capture(id: UUID().uuidString.lowercased(), quiz: quiz, number: number, period: period, answers: answers,
-                                  name: Reader.nameStrip(layout, image, map), scannedAt: Date())
-            onEvent?(.captured(capture))
-            takePhoto(capture)
-        }
-        emit(quiz, map, out)
-    }
+        let steady = zip(corners, track.corners).allSatisfy { hypot($0.x - $1.x, $0.y - $1.y) < 0.02 }
+        track.corners = corners
+        track.lastSeen = time
+        guard let unit = Homography(BoxFinder.unitCorners, corners) else { return (SheetInView(track: track.id, gate: track.gate.step(nothing)), nil) }
 
-    /// A ZipGrade form: no test code on it, so it's read as the test the teacher chose for ZipGrade sheets.
-    private func readZipGrade(_ image: LumaImage, _ corners: [CGPoint], _ unit: Homography, _ time: TimeInterval) {
-        let layout = ZipGrade.form20
-        guard let quiz = zipgradeQuiz, let map = Homography(layout.cornerPoints, corners) else {
-            var info = FrameInfo(quiz: nil, map: unit, unknownTest: false, wrongTest: false, gate: gate.step(GateFrame(time: time, sheet: nil)))
-            info.zipgrade = true
-            info.needsTest = true
-            onEvent?(.frame(info))
-            return
+        var quiz: Quiz?, layout: SheetLayout?, number: Int?, identity = ""
+        if sheet.kind == .zipgrade20 {
+            guard let chosen = zipgradeQuiz else {
+                return (SheetInView(track: track.id, map: unit, zipgrade: true, needsTest: true, gate: track.gate.step(nothing)), nil)
+            }
+            quiz = chosen
+            layout = ZipGrade.form20
+            identity = "\(chosen.id)|zipgrade"
+        } else {
+            guard let code = Reader.testCode(image, unit) ?? (steady ? track.lastCode : nil) else {
+                track.lastCode = nil
+                return (SheetInView(track: track.id, map: unit, gate: track.gate.step(nothing)), nil)
+            }
+            track.lastCode = code
+            guard let known = tests[code], known.layout != nil else {
+                return (SheetInView(track: track.id, map: unit, unknownTest: true, gate: track.gate.step(nothing)), nil)
+            }
+            quiz = known
+            layout = known.layout
+            number = Reader.studentNumber(image, unit) ?? (steady ? track.lastNumber : nil)
+            track.lastNumber = number
+            identity = "\(known.id)|\(number ?? 0)"
         }
+        guard let quiz, let layout, let map = Homography(layout.cornerPoints, corners) else {
+            return (SheetInView(track: track.id, map: unit, gate: track.gate.step(nothing)), nil)
+        }
+        var info = SheetInView(track: track.id, quiz: quiz, map: map, layout: layout, zipgrade: sheet.kind == .zipgrade20, gate: .idle)
         if let expected, quiz.id != expected {
-            emit(quiz, map, gate.step(GateFrame(time: time, sheet: nil)), wrong: true, layout: layout, zipgrade: true)
-            return
+            info.wrongTest = true
+            info.gate = track.gate.step(nothing)
+            return (info, nil)
         }
         let read = Reader.read(quiz, layout, image, map)
-        let out = gate.step(GateFrame(time: time, sheet: SheetRead(corners: corners, identity: "\(quiz.id)|zipgrade",
-                                                                  period: nil, answers: read.answers)))
-        if case .fire(_, let answers) = out {
-            var capture = Capture(id: UUID().uuidString.lowercased(), quiz: quiz, number: nil, period: nil, answers: answers,
-                                  name: Reader.nameStrip(layout, image, map), scannedAt: Date())
-            capture.kind = .zipgrade20
-            capture.periodBox = layout.periodBox.flatMap { Reader.strip($0, image, map) }
-            onEvent?(.captured(capture))
-            takePhoto(capture)
-        }
-        emit(quiz, map, out, layout: layout, zipgrade: true)
+        info.gate = track.gate.step(GateFrame(time: time, sheet: SheetRead(corners: corners, identity: identity, period: read.period, answers: read.answers)))
+        guard case .fire(let period, let answers) = info.gate else { return (info, nil) }
+        var capture = Capture(id: UUID().uuidString.lowercased(), quiz: quiz, number: number, period: period, answers: answers,
+                              name: Reader.nameStrip(layout, image, map), scannedAt: Date())
+        capture.kind = sheet.kind
+        capture.periodBox = layout.periodBox.flatMap { Reader.strip($0, image, map) }
+        capture.dateBox = layout.dateBox.flatMap { Reader.strip($0, image, map) }
+        capture.track = track.id
+        capture.corners = corners
+        return (info, capture)
     }
 
-    private func emit(_ quiz: Quiz?, _ map: Homography?, _ gate: GateOutput, unknown: Bool = false, wrong: Bool = false,
-                      layout: SheetLayout? = nil, zipgrade: Bool = false) {
-        var info = FrameInfo(quiz: quiz, map: map, layout: layout ?? quiz?.layout, unknownTest: unknown, wrongTest: wrong, gate: gate)
-        info.zipgrade = zipgrade
-        onEvent?(.frame(info))
-    }
-
-    /// One full-resolution, silent (where iOS allows) photo of the captured sheet. It settles answers the video
-    /// couldn't read, reads the handwritten name better, and is kept, marked, for the record.
-    private func takePhoto(_ capture: Capture) {
-        let failed = PhotoResult(id: capture.id, answers: nil, period: nil, name: nil, jpeg: nil)
-        guard session.isRunning, let layout = capture.kind.layout(for: capture.quiz),
-              photoOutput.availablePhotoPixelFormatTypes.contains(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) else {
-            onEvent?(.photo(failed))
+    /// One full-resolution, silent (where iOS allows) photo for the sheets just captured. It settles answers the
+    /// video couldn't read, reads the handwritten names better, and is kept, clean, for the record.
+    private func takePhoto(_ captures: [Capture]) {
+        let failed: (Capture) -> PhotoResult = { PhotoResult(id: $0.id, answers: nil, period: nil, name: nil, jpeg: nil) }
+        guard session.isRunning, photoOutput.availablePhotoPixelFormatTypes.contains(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) else {
+            for capture in captures { onEvent?(.photo(failed(capture))) }
             return
         }
         let settings = AVCapturePhotoSettings(format: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange])
         settings.maxPhotoDimensions = photoOutput.maxPhotoDimensions
-        settings.photoQualityPrioritization = .balanced
+        settings.photoQualityPrioritization = .speed   // quick, and the camera keeps running smoothly
         if #available(iOS 18.0, *), photoOutput.isShutterSoundSuppressionSupported { settings.isShutterSoundSuppressionEnabled = true }
         let id = settings.uniqueID
         let job = PhotoJob { [weak self] pixels in
             guard let self else { return }
             self.queue.async { self.photoJobs[id] = nil }
             self.photoQueue.async {
-                self.onEvent?(.photo(self.read(pixels, capture, layout) ?? failed))
+                for result in self.read(pixels, captures) { self.onEvent?(.photo(result)) }
             }
         }
         photoJobs[id] = job
         photoOutput.capturePhoto(with: settings, delegate: job)
     }
 
-    private func read(_ pixels: CVPixelBuffer?, _ capture: Capture, _ layout: SheetLayout) -> PhotoResult? {
-        guard let pixels else { return nil }
+    private func read(_ pixels: CVPixelBuffer?, _ captures: [Capture]) -> [PhotoResult] {
+        let failed: (Capture) -> PhotoResult = { PhotoResult(id: $0.id, answers: nil, period: nil, name: nil, jpeg: nil) }
+        guard let pixels else { return captures.map(failed) }
         CVPixelBufferLockBaseAddress(pixels, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixels, .readOnly) }
-        guard let base = CVPixelBufferGetBaseAddressOfPlane(pixels, 0) else { return nil }
+        guard let base = CVPixelBufferGetBaseAddressOfPlane(pixels, 0) else { return captures.map(failed) }
         let image = LumaImage(base: base.assumingMemoryBound(to: UInt8.self),
                               width: CVPixelBufferGetWidthOfPlane(pixels, 0), height: CVPixelBufferGetHeightOfPlane(pixels, 0),
                               bytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(pixels, 0))
-        let quiz = capture.quiz
-        guard let found = photoFinder.find(image), found.kind == capture.kind, let unit = Homography(BoxFinder.unitCorners, found.corners),
-              capture.kind == .zipgrade20 || Reader.testCode(image, unit) == quiz.sheetCode,
-              let map = Homography(layout.cornerPoints, found.corners) else { return nil }
-        let read = Reader.read(quiz, layout, image, map, align: true)
-        guard read.answers.count == capture.answers.count else { return nil }
-        // The photo is sharper, so its reading wins. Rows it couldn't call are settled when no mark could be right.
-        let review = Review.rows(read.answers, marks: read.marks, key: quiz.answerKey)
-        // The photo is kept clean; the ✓ and ✗ are drawn over it when shown, so they always match the teacher's calls.
-        return PhotoResult(id: capture.id, answers: review.answers, period: read.period,
-                           name: Reader.nameStrip(layout, image, map, pixelsPerInch: 200),
-                           jpeg: Reader.sheetJPEG(layout, [], image, map, pixelsPerInch: 150),
-                           rows: review.rows,
-                           periodBox: layout.periodBox.flatMap { Reader.strip($0, image, map, pixelsPerInch: 200) })
+        let found = photoFinder.findAll(image, limit: 8, accept: { sheet in
+            guard sheet.kind == .gradescan else { return true }
+            return Homography(BoxFinder.unitCorners, sheet.corners).flatMap { Reader.testCode(image, $0) } != nil
+        })
+        let photoAspect = Double(image.width) / Double(image.height)
+        return captures.map { capture in
+            guard let sheet = match(capture, in: found, photoAspect: photoAspect), let layout = capture.kind.layout(for: capture.quiz),
+                  let unit = Homography(BoxFinder.unitCorners, sheet.corners),
+                  capture.kind == .zipgrade20 || Reader.testCode(image, unit) == capture.quiz.sheetCode,
+                  let map = Homography(layout.cornerPoints, sheet.corners) else { return failed(capture) }
+            let quiz = capture.quiz
+            let read = Reader.read(quiz, layout, image, map, align: true)
+            guard read.answers.count == capture.answers.count else { return failed(capture) }
+            // The photo is sharper, so its reading wins. The photo is kept clean; the apps draw the ✓ and ✗ over it.
+            let review = Review.rows(read.answers, marks: read.marks, key: quiz.answerKey)
+            return PhotoResult(id: capture.id, answers: review.answers, period: read.period,
+                               name: Reader.nameStrip(layout, image, map, pixelsPerInch: 200),
+                               jpeg: Reader.sheetJPEG(layout, [], image, map, pixelsPerInch: 150),
+                               rows: review.rows,
+                               periodBox: layout.periodBox.flatMap { Reader.strip($0, image, map, pixelsPerInch: 200) },
+                               dateBox: layout.dateBox.flatMap { Reader.strip($0, image, map, pixelsPerInch: 200) })
+        }
+    }
+
+    /// The sheet in the photo that was at the capture's place in the video frame. The two can crop the sensor
+    /// differently (16:9 video, 4:3 photo), so the video position is mapped into the photo's frame first.
+    private func match(_ capture: Capture, in found: [FoundSheet], photoAspect: Double) -> FoundSheet? {
+        let v = CGPoint(x: capture.corners.reduce(0) { $0 + $1.x } / 4, y: capture.corners.reduce(0) { $0 + $1.y } / 4)
+        let p: CGPoint
+        if photoAspect < capture.videoAspect {        // the photo shows more above and below
+            p = CGPoint(x: v.x, y: 0.5 + (v.y - 0.5) * photoAspect / capture.videoAspect)
+        } else {                                      // the photo shows more at the sides
+            p = CGPoint(x: 0.5 + (v.x - 0.5) * capture.videoAspect / photoAspect, y: v.y)
+        }
+        let same = found.filter { $0.kind == capture.kind }
+        guard let best = same.min(by: { hypot($0.center.x - p.x, $0.center.y - p.y) < hypot($1.center.x - p.x, $1.center.y - p.y) }),
+              hypot(best.center.x - p.x, best.center.y - p.y) < 0.15 else { return nil }
+        return best
     }
 }
 
-/// Camera preview with the found sheet outlined. While a sheet locks on, a sage stroke grows around it.
+/// Camera preview with each sheet in view outlined. While a sheet locks on, a sage stroke grows around it.
 final class PreviewView: UIView {
     enum Look { case plain, locking(Double), done, warn }
 
     override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
     var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
 
-    private let outline = CAShapeLayer()
-    private let progress = CAShapeLayer()
+    private final class Outline {
+        let line = CAShapeLayer()
+        let progress = CAShapeLayer()
+        var shown: [CGPoint] = []   // corners on screen, smoothed
+        var misses = 0
+    }
+    private var outlines: [Int: Outline] = [:]
     private let flashLayer = CAShapeLayer()
-    private var misses = 0
-    private var shown: [CGPoint] = []   // outline corners on screen, smoothed
     private(set) var frozen = false
 
     private static let white = UIColor.white.withAlphaComponent(0.9).cgColor
     private static let sage = UIColor(red: 0x98 / 255, green: 0xA8 / 255, blue: 0x69 / 255, alpha: 1).cgColor
-    private static let amber = UIColor(cgColor: MarkPaths.amber).cgColor
+    private static let amber = MarkPaths.amber
 
     /// Holds the picture still (single mode, while the result card is up).
     func freeze(_ on: Bool) {
@@ -353,17 +439,6 @@ final class PreviewView: UIView {
         super.init(frame: frame)
         backgroundColor = .black
         previewLayer.videoGravity = .resizeAspectFill
-        for shape in [outline, progress] {
-            shape.fillColor = UIColor.clear.cgColor
-            shape.lineJoin = .round
-            shape.lineCap = .round
-            layer.addSublayer(shape)
-        }
-        outline.lineWidth = 3
-        outline.strokeColor = Self.white
-        progress.lineWidth = 6
-        progress.strokeColor = Self.sage
-        progress.strokeEnd = 0
         flashLayer.fillColor = UIColor.white.withAlphaComponent(0.6).cgColor
         flashLayer.opacity = 0
         layer.addSublayer(flashLayer)
@@ -373,51 +448,66 @@ final class PreviewView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        for shape in [outline, progress, flashLayer] { shape.frame = bounds }
+        flashLayer.frame = bounds
+        for o in outlines.values { o.line.frame = bounds; o.progress.frame = bounds }
     }
 
-    /// Outlines the sheet. `quad` is its corners in capture-device points (0–1), or nil when no sheet is in view.
-    func show(_ quad: [CGPoint]?, _ look: Look) {
+    private func outline(_ id: Int) -> Outline {
+        if let o = outlines[id] { return o }
+        let o = Outline()
+        for shape in [o.line, o.progress] {
+            shape.frame = bounds
+            shape.fillColor = UIColor.clear.cgColor
+            shape.lineJoin = .round
+            shape.lineCap = .round
+            layer.insertSublayer(shape, below: flashLayer)
+        }
+        o.line.lineWidth = 3
+        o.progress.lineWidth = 6
+        o.progress.strokeColor = Self.sage
+        o.progress.strokeEnd = 0
+        outlines[id] = o
+        return o
+    }
+
+    /// Outlines the sheets in view: each quad is a sheet's corners in capture-device points (0–1).
+    func show(_ sheets: [(id: Int, quad: [CGPoint], look: Look)]) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
         if frozen { return }
-        guard let quad, quad.count == 4 else {
-            misses += 1
-            if misses > 12 {   // about 0.4 s without a sheet; short misses don't make the outline flash
-                outline.path = nil
-                progress.path = nil
-                shown = []
+        let visible = Set(sheets.map(\.id))
+        for (id, o) in outlines where !visible.contains(id) {
+            o.misses += 1
+            if o.misses > 12 {   // about 0.4 s out of view; short misses don't make the outline flash
+                o.line.removeFromSuperlayer()
+                o.progress.removeFromSuperlayer()
+                outlines[id] = nil
             }
-            return
         }
-        misses = 0
-        let target = quad.map { previewLayer.layerPointConverted(fromCaptureDevicePoint: $0) }
-        let close = shown.count == 4 && zip(target, shown).allSatisfy { hypot($0.x - $1.x, $0.y - $1.y) < 40 }
-        shown = close ? zip(target, shown).map { CGPoint(x: 0.5 * $0.x + 0.5 * $1.x, y: 0.5 * $0.y + 0.5 * $1.y) } : target
-        let path = quadPath()
-        outline.path = path
-        progress.path = path
-        switch look {
-        case .plain:
-            outline.strokeColor = Self.white
-            progress.strokeEnd = 0
-        case .locking(let p):
-            outline.strokeColor = Self.white
-            progress.strokeEnd = p
-        case .done:
-            outline.strokeColor = Self.sage
-            progress.strokeEnd = 0
-        case .warn:
-            outline.strokeColor = Self.amber
-            progress.strokeEnd = 0
+        for sheet in sheets where sheet.quad.count == 4 {
+            let o = outline(sheet.id)
+            o.misses = 0
+            let target = sheet.quad.map { previewLayer.layerPointConverted(fromCaptureDevicePoint: $0) }
+            let close = o.shown.count == 4 && zip(target, o.shown).allSatisfy { hypot($0.x - $1.x, $0.y - $1.y) < 60 }
+            // Ease toward the new corners so hand tremor doesn't make the outline jitter.
+            o.shown = close ? zip(target, o.shown).map { CGPoint(x: 0.35 * $0.x + 0.65 * $1.x, y: 0.35 * $0.y + 0.65 * $1.y) } : target
+            let path = Self.path(o.shown)
+            o.line.path = path
+            o.progress.path = path
+            switch sheet.look {
+            case .plain: o.line.strokeColor = Self.white; o.progress.strokeEnd = 0
+            case .locking(let p): o.line.strokeColor = Self.white; o.progress.strokeEnd = p
+            case .done: o.line.strokeColor = Self.sage; o.progress.strokeEnd = 0
+            case .warn: o.line.strokeColor = Self.amber; o.progress.strokeEnd = 0
+            }
         }
     }
 
-    /// A quick white flash over the sheet when it's captured.
-    func flash() {
-        guard shown.count == 4 else { return }
-        flashLayer.path = quadPath()
+    /// A quick white flash over a sheet when it's captured.
+    func flash(_ id: Int) {
+        guard let o = outlines[id], o.shown.count == 4 else { return }
+        flashLayer.path = Self.path(o.shown)
         let fade = CABasicAnimation(keyPath: "opacity")
         fade.fromValue = 1
         fade.toValue = 0
@@ -425,9 +515,9 @@ final class PreviewView: UIView {
         flashLayer.add(fade, forKey: "flash")
     }
 
-    private func quadPath() -> CGPath {
+    private static func path(_ points: [CGPoint]) -> CGPath {
         let path = UIBezierPath()
-        for (k, p) in shown.enumerated() {
+        for (k, p) in points.enumerated() {
             if k == 0 { path.move(to: p) } else { path.addLine(to: p) }
         }
         path.close()

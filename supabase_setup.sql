@@ -86,3 +86,6 @@ alter table public.scans add column if not exists review jsonb;
 
 -- Which answer sheet a scan was read from: null = the test's own GradeScan sheet, 'zipgrade20' = ZipGrade's 20-question form.
 alter table public.scans add column if not exists form text;
+
+-- The date the student wrote on the sheet (as read, e.g. '9/25'), to tell a make-up test from the class's.
+alter table public.scans add column if not exists taken_on text;

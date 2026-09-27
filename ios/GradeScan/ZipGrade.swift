@@ -39,7 +39,8 @@ enum ZipGrade {
                            questions: questions,
                            period: [],                          // written by hand in the Period box
                            name: [1.07, 0.16, 2.28, 0.33],       // the Name field
-                           periodBox: [2.72, 0.53, 0.63, 0.31])  // the Period field
+                           periodBox: [2.72, 0.53, 0.63, 0.31],  // the Period field
+                           dateBox: [1.07, 0.53, 0.99, 0.31])    // the Date field
     }()
 
     /// A test a ZipGrade stack can be for: at most 20 questions, A–E.
