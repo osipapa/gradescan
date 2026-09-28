@@ -43,29 +43,66 @@ enum ZipGrade {
                            dateBox: [1.07, 0.53, 0.99, 0.31])    // the Date field
     }()
 
-    /// Whether a candidate really is a ZipGrade form: its printed circles sit where the layout puts the bubbles
-    /// (darker on the circle than on the paper just outside), which filled bubbles lined up like squares can't fake.
+    /// Whether a candidate really is a ZipGrade form: the box for the name, date and period across its top, and its
+    /// printed bubbles where the form puts them. Our own sheet's bubble grid, under a wrong fit, has no such box.
     static func looksReal(_ img: LumaImage, corners: [CGPoint]) -> Bool {
-        let layout = form20
-        guard let map = Homography(layout.cornerPoints, corners) else { return false }
-        var hits = 0, tried = 0
-        for q in [0, 4, 9, 10, 14, 19] {
-            for c in [0, 2, 4] {
-                let p = SheetLayout.point(layout.questions[q][c]), r = layout.r
-                let at: (Double, Double) -> Double = { a, k in img.at(map.apply(CGPoint(x: p.x + k * r * cos(a), y: p.y + k * r * sin(a)))) }
-                let angles = (0..<8).map { Double($0) * .pi / 4 }
-                // The printed line is thin, so look just inside, on, and just outside it and keep the darkest.
-                let circle = angles.reduce(0) { sum, a in sum + [0.84, 0.92, 1.0].map { at(a, $0) }.min()! } / 8
-                let paper = [Double.pi / 2, 3 * .pi / 2].map { at($0, 1.5) }.max() ?? 0   // above and below: rows are far apart
-                tried += 1
-                if paper > 0 && circle < 0.9 * paper { hits += 1 }
-            }
-        }
-        return hits * 3 >= tried * 2
+        guard let map = Homography(form20.cornerPoints, corners) else { return false }
+        return nameBox(img, map) && form20.printed(in: img, map: map)
+    }
+
+    /// The thick border of the Name / Date / Period box (measured from the PDF, layout inches: x 0.41–3.40,
+    /// y 0.13–0.88), each side sampled in several places, darker than the paper just outside the box.
+    private static func nameBox(_ img: LumaImage, _ map: Homography) -> Bool {
+        let at: (Double, Double) -> Double = { x, y in img.at(map.apply(CGPoint(x: x, y: y))) }
+        // Paper: above the box and to its left, clear of the corner square.
+        let paper = ([0.9, 1.6, 2.3, 3.0].map { at($0, 0.06) } + [0.5, 0.7].map { at(0.3, $0) }).sorted()[3]
+        guard paper > 0 else { return false }
+        // The darkest point across each sampled bit of line, allowing for the sheet being a little off.
+        let across = (-4...4).map { Double($0) * 0.012 }
+        let horizontal: (Double, Double) -> Bool = { x, y in across.map { at(x, y + $0) }.min()! < 0.75 * paper }
+        let vertical: (Double, Double) -> Bool = { x, y in across.map { at(x + $0, y) }.min()! < 0.75 * paper }
+        let top = [0.8, 1.5, 2.2, 2.9].filter { horizontal($0, 0.1475) }.count
+        let bottom = [0.8, 1.5, 2.2, 2.9].filter { horizontal($0, 0.8645) }.count
+        let sides = [0.3, 0.7].filter { vertical(0.4315, $0) }.count + [0.3, 0.7].filter { vertical(3.386, $0) }.count
+        return top + bottom + sides >= 10 && top >= 2 && bottom >= 2
     }
 
     /// A test a ZipGrade stack can be for: at most 20 questions, A–E.
     static func fits(_ quiz: Quiz) -> Bool { quiz.numQuestions <= 20 && quiz.numChoices <= 5 }
 
     private static func r3(_ x: Double) -> Double { (x * 1000).rounded() / 1000 }
+}
+
+extension SheetLayout {
+    /// Whether this layout's bubbles are printed where `map` puts them: at least half are empty printed circles
+    /// (the line darker than the paper inside and outside it) and seven in ten are circles or filled in. Students
+    /// fill one bubble a row, so a real sheet has plenty of empty circles. Another sheet's bubble grid under a wrong
+    /// fit matches only some of them, and a patch of filled bubbles has no empty circles.
+    func printed(in img: LumaImage, map: Homography) -> Bool {
+        let angles = (0..<8).map { Double($0) * .pi / 4 }
+        // A curled sheet puts its bubbles a little off from where the corners say, so each is also looked for a
+        // third of a bubble to each side.
+        let shifts = [CGPoint.zero, CGPoint(x: 0.35 * r, y: 0), CGPoint(x: -0.35 * r, y: 0), CGPoint(x: 0, y: 0.35 * r), CGPoint(x: 0, y: -0.35 * r)]
+        var empty = 0, filled = 0, tried = 0
+        for row in questions {
+            for bubble in row {
+                tried += 1
+                var isFilled = false
+                for shift in shifts {
+                    let p = SheetLayout.point(bubble)
+                    let c = CGPoint(x: p.x + shift.x, y: p.y + shift.y)
+                    let at: (Double, Double) -> Double = { a, k in img.at(map.apply(CGPoint(x: c.x + k * r * cos(a), y: c.y + k * r * sin(a)))) }
+                    // The printed line is thin, so look just inside, on, and just outside it and keep the darkest.
+                    let circle = angles.reduce(0) { sum, a in sum + [0.84, 0.92, 1.0].map { at(a, $0) }.min()! } / 8
+                    let inside = angles.reduce(0) { $0 + at($1, 0.45) } / 8
+                    let outside = [Double.pi / 2, 3 * .pi / 2].map { at($0, 1.5) }.max() ?? 0   // above and below: rows are far apart
+                    guard outside > 0 else { continue }
+                    if circle < 0.95 * min(inside, outside) { empty += 1; isFilled = false; break }
+                    if inside < 0.75 * outside && circle < 0.9 * outside { isFilled = true }
+                }
+                if isFilled { filled += 1 }
+            }
+        }
+        return tried > 0 && empty * 2 >= tried && (empty + filled) * 10 >= tried * 7
+    }
 }

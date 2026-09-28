@@ -4,24 +4,64 @@ import Vision
 
 /// Reads the handwritten name with on-device text recognition. Nothing leaves the phone except the result.
 enum NameReader {
-    static func read(_ strip: GrayStrip) async -> String? {
-        guard let image = strip.cgImage() else { return nil }
-        return await Task.detached(priority: .userInitiated) { recognize(image) }.value
+    /// Everything read from one handwritten name.
+    struct Result: Sendable {
+        var text: String?                        // the plainest reading, to show and to store
+        var readings: [NameMatch.Reading] = []   // every reading, for matching to the class list
+        var handwriting: [Float]?                // what the writing looks like, for HandwritingMemory
     }
 
-    static func recognize(_ image: CGImage) -> String? {
+    /// Two looks at the name, both on a white margin (writing that touches the edge of the picture is often missed):
+    /// letter by letter as written, and with language correction, which also lists up to ten alternatives and favors
+    /// the class list's names (`names`).
+    static func read(_ strip: GrayStrip, names: [String] = []) async -> Result {
+        await Task.detached(priority: .userInitiated) { recognize(strip, names: names) }.value
+    }
+
+    static func recognize(_ strip: GrayStrip, names: [String]) -> Result {
+        var result = Result(handwriting: Handwriting.print(strip))
+        guard let image = strip.padded().cgImage() else { return result }
+        let plain = request(correcting: false, names: [])
+        let corrected = request(correcting: true, names: names)
+        guard (try? VNImageRequestHandler(cgImage: image).perform([plain, corrected])) != nil else { return result }
+        let asWritten = readings(plain, pass: 0), alternatives = readings(corrected, pass: 1)
+        result.text = asWritten.first?.text ?? alternatives.first?.text
+        result.readings = asWritten + alternatives
+        return result
+    }
+
+    private static func request(correcting: Bool, names: [String]) -> VNRecognizeTextRequest {
         let request = VNRecognizeTextRequest()
+        request.revision = VNRecognizeTextRequestRevision3
         request.recognitionLevel = .accurate
-        request.usesLanguageCorrection = false   // names aren't dictionary words
+        request.usesLanguageCorrection = correcting   // off: names aren't dictionary words; on: alternatives, class list first
+        if correcting {
+            let words = Set(names.flatMap { $0.split { !$0.isLetter && $0 != "'" && $0 != "-" }.map(String.init) })
+            request.customWords = Array(words.union(words.map { $0.folding(options: [.diacriticInsensitive], locale: nil) })).sorted()
+        }
         let wanted = ["en-US", "es-ES"]
         if let supported = try? request.supportedRecognitionLanguages() {
             request.recognitionLanguages = wanted.filter(supported.contains)
         }
-        guard (try? VNImageRequestHandler(cgImage: image).perform([request])) != nil else { return nil }
-        let words = (request.results ?? [])
-            .sorted { $0.boundingBox.minX < $1.boundingBox.minX }
-            .compactMap { $0.topCandidates(1).first?.string }
-        return clean(words.joined(separator: " "))
+        return request
+    }
+
+    /// Whole-name readings, left to right: each piece of writing's alternatives combined, most confident first.
+    private static func readings(_ request: VNRecognizeTextRequest, pass: Int) -> [NameMatch.Reading] {
+        var beam = [NameMatch.Reading(text: "", confidence: 1, pass: pass)]
+        for observation in (request.results ?? []).sorted(by: { $0.boundingBox.minX < $1.boundingBox.minX }) {
+            let candidates = observation.topCandidates(10)
+            guard !candidates.isEmpty else { continue }
+            var longer: [NameMatch.Reading] = []
+            for sofar in beam {
+                for candidate in candidates {
+                    let text = sofar.text.isEmpty ? candidate.string : sofar.text + " " + candidate.string
+                    longer.append(NameMatch.Reading(text: text, confidence: sofar.confidence * Double(candidate.confidence), pass: pass))
+                }
+            }
+            beam = Array(longer.sorted { $0.confidence > $1.confidence }.prefix(12))
+        }
+        return beam.compactMap { r in clean(r.text).map { NameMatch.Reading(text: $0, confidence: r.confidence, pass: pass) } }
     }
 
     /// A period written by hand (ZipGrade's Period box): the first digit 1–9 it reads, if any.
@@ -60,5 +100,18 @@ enum NameReader {
         let kept = String(text.unicodeScalars.map { CharacterSet.letters.contains($0) || "-' ".unicodeScalars.contains($0) ? Character($0) : " " })
         let name = kept.split(separator: " ").joined(separator: " ").trimmingCharacters(in: CharacterSet(charactersIn: "-' "))
         return name.count >= 2 ? name : nil
+    }
+}
+
+extension GrayStrip {
+    /// The strip on a white margin a third of its height wide.
+    func padded() -> GrayStrip {
+        let m = max(8, height / 3), w = width + 2 * m, h = height + 2 * m
+        var out = [UInt8](repeating: 255, count: w * h)
+        for y in 0..<height {
+            let from = y * width, to = (y + m) * w + m
+            out.replaceSubrange(to..<(to + width), with: pixels[from..<(from + width)])
+        }
+        return GrayStrip(width: w, height: h, pixels: out)
     }
 }

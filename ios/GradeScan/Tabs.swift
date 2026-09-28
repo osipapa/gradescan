@@ -74,21 +74,25 @@ struct NewTestView: View {
         NavigationStack {
             Form {
                 if draft != nil {
+                    // From an answer key sheet the rows and choices are known: just the name, and the key to check.
                     Section {
-                        Text("Read from the answer key sheet. Check the answers, give the test a name, and create it.")
-                            .font(.subheadline).foregroundStyle(.secondary)
+                        TextField("Name (same as in Jupiter)", text: $title)
+                            .focused($naming)
+                    } footer: {
+                        Text("Read from the sheet you held up. Tap a bubble to fix any wrong answer.")
                     }
-                }
-                Section {
-                    TextField("Name (same as in Jupiter)", text: $title)
-                        .focused($naming)
-                    Stepper("\(questions) questions", value: $questions, in: 1...50)
-                    Picker("Answer choices", selection: $choices) {
-                        ForEach(2...5, id: \.self) { Text("A–\(String(Grader.letters[$0 - 1]))").tag($0) }
+                } else {
+                    Section {
+                        TextField("Name (same as in Jupiter)", text: $title)
+                            .focused($naming)
+                        Stepper("\(questions) questions", value: $questions, in: 1...50)
+                        Picker("Answer choices", selection: $choices) {
+                            ForEach(2...5, id: \.self) { Text("A–\(String(Grader.letters[$0 - 1]))").tag($0) }
+                        }
+                        .pickerStyle(.segmented)
+                        Stepper("\(fmt(points)) \(points == 1 ? "point" : "points") each", value: $points, in: 0.25...10, step: 0.25)
+                        Stepper(bonus == 0 ? "No bonus questions" : "Last \(bonus) are bonus", value: $bonus, in: 0...max(0, questions - 1))
                     }
-                    .pickerStyle(.segmented)
-                    Stepper("\(fmt(points)) \(points == 1 ? "point" : "points") each", value: $points, in: 0.25...10, step: 0.25)
-                    Stepper(bonus == 0 ? "No bonus questions" : "Last \(bonus) are bonus", value: $bonus, in: 0...max(0, questions - 1))
                 }
                 Section {
                     ForEach(0..<questions, id: \.self) { i in

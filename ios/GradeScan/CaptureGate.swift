@@ -13,6 +13,61 @@ struct SheetRead {
     let identity: String     // test and printed student number; one physical sheet can't change these
     let period: Int?
     let answers: String      // A–E, "-" blank, "*" two marks, "?" unclear
+    var name: NameMark? = nil   // the handwritten name's rough picture, when there's writing
+}
+
+/// A coarse picture of the handwriting in the name box: enough to tell one student's sheet from another's when
+/// their answers are the same (a stack of perfect scores laid one on top of the next), not to read it.
+struct NameMark {
+    let cells: [Double]   // darkness in a grid over the box, evened out (zero mean, unit spread)
+
+    /// How alike two are: about 1 for the same sheet in two frames, near 0 for different handwriting.
+    func likeness(_ other: NameMark) -> Double {
+        guard cells.count == other.cells.count, !cells.isEmpty else { return 0 }
+        return zip(cells, other.cells).reduce(0) { $0 + $1.0 * $1.1 } / Double(cells.count)
+    }
+
+    /// The handwriting in a layout's name box: a 32 × 4 grid of darkness over the box (its printed edges left out),
+    /// and within each row the change from one cell to the next, so a shadow or the band the writing sits in
+    /// counts for nothing and only the strokes do. Nil when the box is blank.
+    static func read(_ layout: SheetLayout, _ img: LumaImage, _ map: Homography) -> NameMark? {
+        let box = layout.name, cols = 32, rows = 4
+        guard box.count == 4 else { return nil }
+        var grid: [[Double]] = []
+        for r in 0..<rows {
+            var row: [Double] = []
+            for c in 0..<cols {
+                var sum = 0.0
+                for sy in 0..<2 {
+                    for sx in 0..<2 {
+                        let x = box[0] + box[2] * (0.03 + 0.94 * (Double(c) + (Double(sx) + 0.5) / 2) / Double(cols))
+                        let y = box[1] + box[3] * (0.15 + 0.7 * (Double(r) + (Double(sy) + 0.5) / 2) / Double(rows))
+                        sum += img.at(map.apply(CGPoint(x: x, y: y)))
+                    }
+                }
+                row.append(sum / 4)
+            }
+            grid.append(row)
+        }
+        guard let paper = grid.flatMap({ $0 }).max(), paper > 0 else { return nil }
+        let edges = grid.flatMap { row in zip(row.dropFirst(), row).map { ($1 - $0) / paper } }
+        return evened(edges, minSpread: 0.04)
+    }
+
+    static func average(_ marks: [NameMark]) -> NameMark? {
+        guard let first = marks.first else { return nil }
+        let sums = marks.dropFirst().reduce(first.cells) { sum, m in zip(sum, m.cells).map { $0 + $1 } }
+        return evened(sums, minSpread: 0)
+    }
+
+    /// Zero mean and unit spread; nil when there's too little variation to go on (a blank box).
+    static func evened(_ raw: [Double], minSpread: Double) -> NameMark? {
+        guard !raw.isEmpty else { return nil }
+        let mean = raw.reduce(0, +) / Double(raw.count)
+        let spread = (raw.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / Double(raw.count)).squareRoot()
+        guard spread > minSpread else { return nil }
+        return NameMark(cells: raw.map { ($0 - mean) / spread })
+    }
 }
 
 enum GateOutput: Equatable {
@@ -40,11 +95,14 @@ struct CaptureGate {
     private(set) var state: State = .armed
     /// Single mode: pause after each capture until `resume(rescan:)`.
     var pausesAfterCapture = false
+    /// How long a sheet is held steady before it's captured. Longer for an answer key, so the sheet already in
+    /// front of the camera isn't taken while the teacher looks for the key.
+    var lockDuration = CaptureGate.lockDuration
 
     private var run: [SheetRead] = []
     private var runStart: TimeInterval = 0
     private var runOrigin: [CGPoint] = []
-    private var captured: (identity: String, answers: String)?
+    private var captured: (identity: String, answers: String, name: NameMark?)?
     private var absentSince: TimeInterval?
 
     /// Ready to capture whatever is in view.
@@ -91,25 +149,29 @@ struct CaptureGate {
             captured = nil
         }
         let elapsed = frame.time - runStart
-        guard elapsed >= Self.lockDuration, run.count >= Self.minReads else {
-            return state == .cooldown ? .waiting : .locking(min(0.99, max(0, elapsed / Self.lockDuration)))
+        guard elapsed >= lockDuration, run.count >= Self.minReads else {
+            return state == .cooldown ? .waiting : .locking(min(0.99, max(0, elapsed / lockDuration)))
         }
         let (period, answers) = Self.consensus(run)
         let filled = answers.contains { Self.isLetter($0) }
+        let name = NameMark.average(run.compactMap(\.name))
         switch state {
         case .armed:
-            return filled ? fire(sheet.identity, period, answers) : .blank
+            return filled ? fire(sheet.identity, period, answers, name) : .blank
         case .cooldown:
-            // Same sheet unless several confident answers differ: a new sheet laid on top without a gap.
-            guard filled, let c = captured, Self.differences(c.answers, answers) >= Self.differentAnswers else { return .waiting }
-            return fire(sheet.identity, period, answers)
+            // Same sheet unless several confident answers differ, or the handwritten name does: a new sheet laid on
+            // top without a gap (in a stack, two students can have the same answers).
+            guard filled, let c = captured else { return .waiting }
+            let otherName = c.name.map { old in name.map { $0.likeness(old) < 0.35 } ?? false } ?? false
+            guard Self.differences(c.answers, answers) >= Self.differentAnswers || otherName else { return .waiting }
+            return fire(sheet.identity, period, answers, name)
         case .paused:
             return .waiting
         }
     }
 
-    private mutating func fire(_ identity: String, _ period: Int?, _ answers: String) -> GateOutput {
-        captured = (identity, answers)
+    private mutating func fire(_ identity: String, _ period: Int?, _ answers: String, _ name: NameMark?) -> GateOutput {
+        captured = (identity, answers, name)
         state = pausesAfterCapture ? .paused : .cooldown
         run = []
         return .fire(period: period, answers: answers)

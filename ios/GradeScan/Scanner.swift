@@ -6,6 +6,7 @@ enum ScanEvent {
     case frame(FrameInfo)     // every camera frame: the sheets in view, for the outlines and the status
     case captured(Capture)    // a sheet was captured (from the video, right away)
     case photo(PhotoResult)   // its full-resolution photo was read, a moment later
+    case alreadyScanned       // the sheet just captured came round again (lost for a moment, then found): not taken twice
 }
 
 /// One sheet in view, followed from frame to frame.
@@ -18,11 +19,21 @@ struct SheetInView {
     var wrongTest = false     // a known test, but not the one being rescanned
     var zipgrade = false      // a ZipGrade form
     var needsTest = false     // …and the teacher hasn't said which test ZipGrade sheets are for
+    var partial = false       // a corner is out of sight (a thumb, glare): outlined where it was, not read
     var gate: GateOutput
 }
 
 struct FrameInfo {
     let sheets: [SheetInView]
+    var hint: ScanHint?   // what to change, once nothing has locked on for a moment
+}
+
+/// What the teacher can do when no sheet locks on.
+enum ScanHint: Equatable {
+    case dark      // too dark (the flashlight comes on by itself)
+    case glare     // light washing out part of the sheet
+    case far       // too far away to be sure of the squares
+    case corners   // a corner is out of view or covered
 }
 
 struct Capture {
@@ -84,10 +95,19 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
         var lastNumber: Int?
         var frames = 0   // frames it's been found in; it's outlined from the third, so one-frame flukes never show
         var ignored = false   // already used for something else (an answer key): passed over until it leaves the view
+        var kind = SheetKind.gradescan
+        var lastInfo: SheetInView?   // what was shown for it, kept while a corner is out of sight
         var center: CGPoint { CGPoint(x: corners.reduce(0) { $0 + $1.x } / 4, y: corners.reduce(0) { $0 + $1.y } / 4) }
     }
     private var tracks: [Track] = []
     private var nextTrack = 1
+    /// What was captured lately: a sheet lost for a moment and found again comes back as a new track, with a new
+    /// gate, and would be captured twice. The same test and student number, the same answers, in about the same
+    /// place, a few seconds later, is the same sheet.
+    private var recent: [(identity: String, answers: String, name: NameMark?, center: CGPoint, time: TimeInterval)] = []
+    private var answerKey = false   // reading an answer key: a longer, deliberate hold
+    private var searchingSince: TimeInterval?   // when the camera last stopped seeing a sheet it can read
+    private var frameRequest: ((Data?, String) -> Void)?   // save the next frame, for a sheet that won't scan
     private var single = false      // one sheet at a time, and scanning waits after each capture
     private var paused = false      // single mode: waiting for the teacher after a capture
     private var expected: String?   // during a rescan, the only test that may be captured
@@ -97,6 +117,24 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
     /// Passes over the sheets in view until they leave it (the answer key just read, so it isn't scanned as a student's).
     func ignoreInView() {
         queue.async { for i in self.tracks.indices { self.tracks[i].ignored = true } }
+    }
+
+    /// Hands over the next camera frame as a JPEG, with a note of what the scanner made of it (JSON).
+    func saveNextFrame(_ done: @escaping (Data?, String) -> Void) {
+        queue.async { self.frameRequest = done }
+    }
+
+    /// Reading an answer key: the sheets already in view are passed over (the teacher is still looking for the key),
+    /// and the key has to be held steady for a second before it's taken.
+    func setAnswerKey(_ on: Bool) {
+        queue.async {
+            self.answerKey = on
+            self.paused = false
+            for i in self.tracks.indices {
+                if on { self.tracks[i].ignored = true }
+                self.tracks[i].gate.lockDuration = on ? 1.0 : CaptureGate.lockDuration
+            }
+        }
     }
 
     func setTests(_ list: [Quiz]) {
@@ -239,15 +277,18 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
                               width: CVPixelBufferGetWidthOfPlane(pixels, 0),
                               height: CVPixelBufferGetHeightOfPlane(pixels, 0),
                               bytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(pixels, 0))
-        // A candidate of ours is a real sheet if the code of one of the teacher's tests reads on it, or any code reads
-        // crisply (a test not on this phone yet), or it sits where a sheet with a code was a moment ago and the code
-        // blurred for a frame. A ZipGrade candidate needs its printed bubbles where the form puts them.
+        // A candidate of ours is a real sheet if one of the teacher's tests' codes reads on it and that test's bubbles
+        // are printed where its layout puts them; or, for a test not on this phone yet, if a code reads crisply
+        // and the strip above the sheet is blank or a student number. A ZipGrade candidate needs its printed
+        // bubbles where the form puts them. (A sheet whose code blurs for a frame is followed; see below.)
         let accept: (FoundSheet) -> Bool = { sheet in
             guard sheet.kind == .gradescan else { return ZipGrade.looksReal(image, corners: sheet.corners) }
-            if let unit = Homography(BoxFinder.unitCorners, sheet.corners), let code = Reader.testCode(image, unit),
-               self.tests[code] != nil || Reader.testCode(image, unit, strict: true) != nil { return true }
-            let c = sheet.center
-            return self.tracks.contains { $0.lastCode != nil && hypot($0.center.x - c.x, $0.center.y - c.y) < 0.03 }
+            guard let unit = Homography(BoxFinder.unitCorners, sheet.corners) else { return false }
+            if let code = Reader.testCode(image, unit), let quiz = self.tests[code] {
+                guard let layout = quiz.layout, let map = Homography(layout.cornerPoints, sheet.corners) else { return false }
+                return layout.printed(in: image, map: map)
+            }
+            return Reader.testCode(image, unit, strict: true) != nil && Self.topStripClean(image, unit)
         }
         // Single mode follows the sheet nearest the middle; batch mode every sheet laid out in view.
         let sheets = single ? finder.find(image, accept: accept).map { [FoundSheet(corners: $0.corners, kind: $0.kind)] } ?? []
@@ -262,10 +303,34 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
                 free.remove(t)
                 matched.append((t, sheet))
             } else {
-                tracks.append(Track(id: nextTrack, corners: sheet.corners, lastSeen: time))
+                var track = Track(id: nextTrack, corners: sheet.corners, lastSeen: time)
+                track.gate.lockDuration = answerKey ? 1.0 : CaptureGate.lockDuration
+                tracks.append(track)
                 nextTrack += 1
                 matched.append((tracks.count - 1, sheet))
             }
+        }
+        // A sheet the full search missed this frame but saw a moment ago (a corner blurred, caught the light, or went
+        // under a thumb): its squares are looked for near where they were. With all four corners and its code
+        // still reading, it's read as usual. With one corner out of sight, it's only outlined, and its gate waits:
+        // it can't be captured, nor count as gone and be captured again.
+        var partial = Set<Int>()
+        for t in free.sorted() where !tracks[t].ignored && time - tracks[t].lastSeen < 0.5 {
+            let track = tracks[t]
+            guard let (sheet, carried) = finder.follow(FoundSheet(corners: track.corners, kind: track.kind), in: image) else { continue }
+            // Read only when it's certainly the same sheet: all four corners, and its code (or ZipGrade's bubbles) still
+            // there. Otherwise, a blurred frame say, it's only outlined.
+            var same = false
+            if !carried {
+                if sheet.kind == .zipgrade20 {
+                    same = ZipGrade.looksReal(image, corners: sheet.corners)
+                } else if let code = Homography(BoxFinder.unitCorners, sheet.corners).flatMap({ Reader.testCode(image, $0) }) {
+                    same = code == track.lastCode
+                }
+            }
+            if !same { partial.insert(t) }
+            free.remove(t)
+            matched.append((t, sheet))
         }
         // A sheet that isn't in view: its gate hears "no sheet" (and re-arms once it's been gone a moment).
         for t in free { _ = tracks[t].gate.step(GateFrame(time: time, sheet: nil)) }
@@ -277,7 +342,19 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
                 tracks[t].lastSeen = time
                 continue
             }
+            if partial.contains(t) {
+                tracks[t].corners = sheet.corners
+                tracks[t].lastSeen = time
+                if var info = tracks[t].lastInfo {
+                    info.map = Homography(info.layout?.cornerPoints ?? BoxFinder.unitCorners, sheet.corners)
+                    info.partial = true
+                    infos.append(info)
+                }
+                continue
+            }
+            tracks[t].kind = sheet.kind
             let (info, capture) = follow(t, sheet, image, time)
+            tracks[t].lastInfo = info
             tracks[t].frames += 1
             if tracks[t].frames >= 3 || capture != nil { infos.append(info) }
             if var capture {
@@ -286,12 +363,40 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
             }
         }
         tracks.removeAll { time - $0.lastSeen > ($0.ignored ? 0.4 : 1.5) }
-        onEvent?(.frame(FrameInfo(sheets: infos)))
+        let frameHint = hint(infos, time)
+        onEvent?(.frame(FrameInfo(sheets: infos, hint: frameHint)))
+        if let request = frameRequest {
+            frameRequest = nil
+            let look = finder.look
+            let note: [String: Any] = [
+                "found": sheets.map { ["kind": $0.kind.rawValue, "corners": $0.corners.map { [$0.x, $0.y] }] },
+                "tracks": tracks.count, "hint": frameHint.map { "\($0)" } ?? "none", "single": single,
+                "brightness": look.brightness, "glare": look.glare, "far": look.tiny,
+                "size": [image.width, image.height], "app": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "",
+            ]
+            let json = (try? JSONSerialization.data(withJSONObject: note, options: [.prettyPrinted, .sortedKeys])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+            request(ProblemFrames.jpeg(image), json)
+        }
         if !captures.isEmpty {
             for capture in captures { onEvent?(.captured(capture)) }
             takePhoto(captures)
             if single { paused = true }
         }
+    }
+
+    /// Once nothing readable has been in view for a moment, the likeliest reason: a covered corner, too little light,
+    /// glare, or distance.
+    private func hint(_ infos: [SheetInView], _ time: TimeInterval) -> ScanHint? {
+        if infos.contains(where: { !$0.partial }) { searchingSince = nil; return nil }
+        let since = searchingSince ?? time
+        searchingSince = since
+        guard time - since > 1.2 else { return nil }
+        if !infos.isEmpty { return .corners }
+        let look = finder.look
+        if look.brightness < 55 { return .dark }
+        if look.glare > 0.004 { return .glare }
+        if look.tiny { return .far }
+        return nil
     }
 
     /// Reads one sheet in view and steps its gate. Returns what to show for it, and a capture when the gate fires.
@@ -337,9 +442,26 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
             info.gate = track.gate.step(nothing)
             return (info, nil)
         }
-        let read = Reader.read(quiz, layout, image, map)
-        info.gate = track.gate.step(GateFrame(time: time, sheet: SheetRead(corners: corners, identity: identity, period: read.period, answers: read.answers)))
+        let read = Reader.read(quiz, layout, image, map), name = NameMark.read(layout, image, map)
+        var frame = SheetRead(corners: corners, identity: identity, period: read.period, answers: read.answers)
+        frame.name = name
+        info.gate = track.gate.step(GateFrame(time: time, sheet: frame))
         guard case .fire(let period, let answers) = info.gate else { return (info, nil) }
+        // Came round again: the same sheet captured a moment ago here, lost from view for a moment and found again:
+        // the same answers, and not a different handwritten name. (A rescan is the teacher asking for it again.)
+        let center = track.center
+        recent.removeAll { time - $0.time > 15 }
+        let seen = recent.contains { r in
+            let otherName = r.name.map { old in name.map { $0.likeness(old) < 0.35 } ?? false } ?? false
+            return r.identity == identity && hypot(r.center.x - center.x, r.center.y - center.y) < 0.2
+                && zip(r.answers, answers).filter { $0 != $1 }.count <= 1 && !otherName
+        }
+        if expected == nil && seen {
+            info.gate = .waiting
+            onEvent?(.alreadyScanned)
+            return (info, nil)
+        }
+        recent.append((identity, answers, name, center, time))
         var capture = Capture(id: UUID().uuidString.lowercased(), quiz: quiz, number: number, period: period, answers: answers,
                               name: Reader.nameStrip(layout, image, map), scannedAt: Date())
         capture.kind = sheet.kind
@@ -349,6 +471,21 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
         capture.corners = corners
         capture.picture = Reader.sheetJPEG(layout, [], image, map, pixelsPerInch: 110)
         return (info, capture)
+    }
+
+    /// The strip between the top corner squares, where a named sheet has its student number: blank paper, or a
+    /// number that reads. Filled bubbles that line up like a sheet leave ink there.
+    private static func topStripClean(_ img: LumaImage, _ unit: Homography) -> Bool {
+        if Reader.studentNumber(img, unit) != nil { return true }
+        let width = Double(img.width), height = Double(img.height)
+        return (0..<16).allSatisfy { i in
+            let u = 0.2 + Double(i) * 0.04
+            let c = unit.apply(CGPoint(x: u, y: 0)), next = unit.apply(CGPoint(x: u + 0.04, y: 0))
+            let pitch = hypot((next.x - c.x) * width, (next.y - c.y) * height)
+            let at: (Double, Double) -> Double = { dx, dy in img.at(CGPoint(x: c.x + dx / width, y: c.y + dy / height)) }
+            let ink = at(0, 0), paper = (0..<8).map { k in at(0.5 * pitch * cos(Double(k) * .pi / 4), 0.5 * pitch * sin(Double(k) * .pi / 4)) }.max() ?? 0
+            return paper > 0 && 1 - ink / paper < 0.2
+        }
     }
 
     /// One full-resolution, silent (where iOS allows) photo for the sheets just captured. It settles answers the
@@ -384,10 +521,12 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @un
         let image = LumaImage(base: base.assumingMemoryBound(to: UInt8.self),
                               width: CVPixelBufferGetWidthOfPlane(pixels, 0), height: CVPixelBufferGetHeightOfPlane(pixels, 0),
                               bytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(pixels, 0))
-        let codes = Set(captures.compactMap(\.quiz.sheetCode))
+        let byCode = Dictionary(captures.compactMap { c in c.quiz.sheetCode.map { ($0, c.quiz) } }, uniquingKeysWith: { a, _ in a })
         let found = photoFinder.findAll(image, limit: 8, accept: { sheet in
             guard sheet.kind == .gradescan else { return ZipGrade.looksReal(image, corners: sheet.corners) }
-            return Homography(BoxFinder.unitCorners, sheet.corners).flatMap { Reader.testCode(image, $0) }.map(codes.contains) == true
+            guard let code = Homography(BoxFinder.unitCorners, sheet.corners).flatMap({ Reader.testCode(image, $0) }),
+                  let layout = byCode[code]?.layout, let map = Homography(layout.cornerPoints, sheet.corners) else { return false }
+            return layout.printed(in: image, map: map)
         })
         let photoAspect = Double(image.width) / Double(image.height)
         return captures.map { capture in

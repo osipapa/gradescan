@@ -234,7 +234,17 @@ struct StudentPicker: View {
             }
             .overlay {
                 if store.students.isEmpty {
-                    ContentUnavailableView("No class list", systemImage: "person.2", description: Text("Add students in the portal."))
+                    ContentUnavailableView {
+                        Label("No class list yet", systemImage: "person.2")
+                    } description: {
+                        Text("Import your class from Jupiter with the camera, then pick the name here.")
+                    } actions: {
+                        Button("Import class list") {
+                            dismiss()
+                            store.startClassImport()
+                        }
+                        .primaryButton()
+                    }
                 }
             }
             .searchable(text: $search, prompt: "Search names")

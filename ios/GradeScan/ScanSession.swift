@@ -6,7 +6,9 @@ import UIKit
 /// The camera and what it captured: the batch and its review, or the single-mode card.
 @MainActor
 final class ScanSession: ObservableObject {
-    enum Mode: String, CaseIterable { case single, batch }
+    /// Single: one sheet, result right away. Batch: sheet after sheet, reviewed at the end. Stand: batch with the
+    /// phone propped up over the table and sheets slid under it, a tick for each one.
+    enum Mode: String, CaseIterable { case single, batch, stand }
 
     struct Pill: Equatable {
         enum Tone { case plain, good, warn }
@@ -20,6 +22,7 @@ final class ScanSession: ObservableObject {
         didSet {
             guard mode != oldValue else { return }
             UserDefaults.standard.set(mode.rawValue, forKey: "scanMode")
+            if mode == .stand { note("Prop the phone up over the table and slide the sheets under it, one after another. You'll hear a tick for each.") }
             card = nil
             if let single { finishSingle(single) }
             scanner.configure(single: mode == .single, expect: nil)
@@ -37,6 +40,7 @@ final class ScanSession: ObservableObject {
     @Published private(set) var cameraDenied = false
     @Published private(set) var note: String?
     @Published private(set) var torch = false
+    private var torchTurnedOff = false
     /// The test this batch's ZipGrade sheets are for (they carry no test code). The teacher is asked for every batch:
     /// it's forgotten when the batch is finished or thrown away, and never saved.
     @Published var zipgradeQuizId: String? {
@@ -67,6 +71,7 @@ final class ScanSession: ObservableObject {
     private var heldForCard = false
     private var watch: AnyCancellable?
     private var conflictWatch: AnyCancellable?
+    private var importWatch: AnyCancellable?
     private lazy var haptics: UINotificationFeedbackGenerator = {
         if #available(iOS 17.5, *) { return UINotificationFeedbackGenerator(view: preview) }
         return UINotificationFeedbackGenerator()
@@ -85,6 +90,12 @@ final class ScanSession: ObservableObject {
             guard let self else { return }
             self.scanner.setTests(tests)
             self.scanner.setZipGrade(self.zipgradeQuizId.flatMap { id in tests.first { $0.id == id } })
+        }
+        // Off to import the class list: the review and any card over the camera close; the batch waits here.
+        importWatch = store.$importingClass.sink { [weak self] on in
+            guard on, let self else { return }
+            self.showReview = false
+            self.card = nil
         }
         // A scan saved without its student because the student already had one: the teacher compares the two.
         conflictWatch = store.$conflicts.sink { [weak self] conflicts in
@@ -112,8 +123,20 @@ final class ScanSession: ObservableObject {
         if items.isEmpty && rescanning == nil { zipgradeQuizId = nil }   // no batch going: the next scan asks again
     }
 
+    /// Keeps what the camera sees right now, for a sheet that won't scan (Settings › Help improve scanning).
+    func saveProblemFrame() {
+        scanner.saveNextFrame { [weak self] jpeg, note in
+            Task { @MainActor [weak self] in
+                guard let jpeg else { return }
+                ProblemFrames.save(jpeg, note: note)
+                self?.note("Frame saved. Share it from Settings.")
+            }
+        }
+    }
+
     func toggleTorch() {
         torch.toggle()
+        if !torch { torchTurnedOff = true }   // it doesn't come back on by itself after that
         scanner.setTorch(torch)
     }
 
@@ -146,13 +169,14 @@ final class ScanSession: ObservableObject {
         card = nil
         scanner.configure(single: true, expect: nil)
         scanner.setZipGrade(Self.keyQuiz)
-        scanner.reset()
+        scanner.setAnswerKey(true)   // not the sheet already in view; hold the key steady a moment
         setPill(Pill(text: "Hold up the answer key"))
     }
 
     func cancelKeyCapture() {
         capturingKey = false
         keyCaptureId = nil
+        scanner.setAnswerKey(false)
         restoreScanning()
     }
 
@@ -162,6 +186,7 @@ final class ScanSession: ObservableObject {
         capturingKey = false
         keyCaptureId = nil
         if let quiz { zipgradeQuizId = quiz.id }
+        scanner.setAnswerKey(false)
         scanner.ignoreInView()   // the key sheet itself isn't a student's
         restoreScanning()
     }
@@ -176,7 +201,7 @@ final class ScanSession: ObservableObject {
     private func showKey(_ answers: String) {
         let letters = answers.map { "ABCDE".contains($0) ? $0 : nil } as [Character?]
         let count = (letters.lastIndex { $0 != nil } ?? 19) + 1
-        keyDraft = KeyDraft(key: Array(letters.prefix(count)), choices: letters.contains("E") ? 5 : 4)
+        keyDraft = KeyDraft(key: Array(letters.prefix(count)), choices: 5)   // ZipGrade's form has A–E
     }
     func student(_ id: String?) -> Student? { id.flatMap { id in store.students.first { $0.id == id } } }
     func isBatch(_ id: String) -> Bool { items.contains { $0.id == id } }
@@ -214,6 +239,10 @@ final class ScanSession: ObservableObject {
             cameraDenied = true
             setPill(Pill(text: "Camera access is off", tone: .warn))
         case .frame(let f):
+            if f.hint == .dark && !torch && !torchTurnedOff {
+                torch = true
+                scanner.setTorch(true)
+            }
             let zipgrade = f.sheets.contains { $0.zipgrade }
             if zipgradeInView != zipgrade { zipgradeInView = zipgrade }
             // Asked on the camera, not in a pop-up that opens by itself: the teacher taps to choose.
@@ -222,13 +251,14 @@ final class ScanSession: ObservableObject {
             if zipgradeNeedsTest != needs { zipgradeNeedsTest = needs }
             preview.show(f.sheets.compactMap { sheet in
                 guard let map = sheet.map else { return nil }
-                let look: PreviewView.Look
+                var look: PreviewView.Look
                 switch sheet.gate {
                 case .locking(let p): look = sheet.unknownTest || sheet.wrongTest ? .warn : .locking(p)
                 case .waiting, .fire: look = .done
                 case .blank: look = .warn
                 case .idle: look = sheet.unknownTest || sheet.wrongTest || sheet.needsTest ? .warn : .plain
                 }
+                if sheet.partial { look = .warn }
                 return (sheet.track, (sheet.layout?.cornerPoints ?? BoxFinder.unitCorners).map { map.apply($0) }, look)
             })
             let unknown = f.sheets.contains(where: \.unknownTest)
@@ -241,22 +271,34 @@ final class ScanSession: ObservableObject {
             captured(c)
         case .photo(let p):
             photoArrived(p)
+        case .alreadyScanned:
+            captureShown = (Pill(text: "Already scanned", tone: .good), Date(), "")
+            setPill(captureShown!.pill)
         }
     }
 
     private func updatePill(_ f: FrameInfo) {
         if let shown = captureShown, Date().timeIntervalSince(shown.at) < 1.6 { return setPill(shown.pill) }
         if f.sheets.contains(where: \.unknownTest) { return setPill(Pill(text: "Not one of your tests", tone: .warn)) }
+        switch f.hint {
+        case .corners?: return setPill(Pill(text: "Keep all four corners in view", tone: .warn))
+        case .dark?: return setPill(Pill(text: torch ? "Still too dark; move to more light" : "Too dark"))
+        case .glare?: return setPill(Pill(text: "Glare on the sheet; tilt it a little"))
+        case .far?: return setPill(Pill(text: "Move closer"))
+        case nil: break
+        }
 
         if let q = f.sheets.first(where: \.wrongTest)?.quiz { return setPill(Pill(text: "This sheet is for \(q.title)", tone: .warn)) }
         let gates = f.sheets.map(\.gate)
         let several = f.sheets.count > 1 ? "\(f.sheets.count) sheets · " : ""
         if capturingKey { return setPill(Pill(text: gates.isEmpty ? "Hold up the answer key" : "Hold steady")) }
-        if gates.isEmpty { return setPill(Pill(text: rescanning == nil ? "Point at the sheets" : "Point at the sheet to rescan")) }
+        if gates.isEmpty {
+            return setPill(Pill(text: rescanning != nil ? "Point at the sheet to rescan" : mode == .stand ? "Slide a sheet under the phone" : "Point at the sheets"))
+        }
         if gates.contains(where: { if case .locking = $0 { return true } else { return false } }) { return setPill(Pill(text: several + "Hold steady")) }
         if gates.contains(.blank) { return setPill(Pill(text: several + "Nothing filled in", tone: .warn)) }
         if gates.allSatisfy({ $0 == .waiting || { if case .fire = $0 { return true } else { return false } }($0) }) {
-            return setPill(Pill(text: mode == .batch ? (f.sheets.count > 1 ? "All captured · next ones" : "Next sheet") : "Captured", tone: .good))
+            return setPill(Pill(text: mode == .single ? "Captured" : f.sheets.count > 1 ? "All captured · next ones" : "Next sheet", tone: .good))
         }
         setPill(Pill(text: several + "Hold steady"))
     }
@@ -327,6 +369,7 @@ final class ScanSession: ObservableObject {
                 self.card = CardRef(id: item.id)
             }
         } else {
+            if mode == .stand { Tick.play() }
             items.append(item)
             saveBatch()
         }
@@ -360,8 +403,11 @@ final class ScanSession: ObservableObject {
 
     /// Reads the handwritten name, matches it to the class list, applies the one-scan-per-student rule, and uploads.
     private func finalize(_ id: String, _ strip: GrayStrip?) async {
-        var read: String?
-        if let strip { read = await NameReader.read(strip) }
+        var reading = NameReader.Result()
+        if let strip { reading = await NameReader.read(strip, names: store.students.map(\.name)) }
+        let read = reading.text
+        // How much the writing looks like each student's earlier sheets.
+        let looks = await HandwritingMemory.shared.likelihoods(reading.handwriting, user: store.session?.userId ?? "local")
         var writtenPeriod: Int?   // ZipGrade: the period is written in a box, not bubbled
         if let box = periodStrips.removeValue(forKey: id) { writtenPeriod = await NameReader.readPeriod(box) }
         var writtenDate: String?
@@ -374,7 +420,7 @@ final class ScanSession: ObservableObject {
         if item.studentId == nil {
             // Students already scanned for this test are less likely to be this sheet.
             let taken = Set(items.filter { $0.quizId == item.quizId && $0.id != id }.compactMap(\.studentId))
-            let guess = NameMatch.decide(read, among: store.students, period: item.period, taken: taken)
+            let guess = NameMatch.decide(reading.readings, among: store.students, period: item.period, taken: taken, handwriting: looks)
             if let student = guess.assign {
                 item.studentId = student.id
                 item.studentName = student.name
@@ -395,15 +441,29 @@ final class ScanSession: ObservableObject {
         }
         update(item)
         store.enqueue(item.upload)
+        learn(item, reading.handwriting)
         if let shown = captureShown, shown.id == id, capturedTogether <= 1, let name = item.studentName {
             captureShown?.pill = Pill(text: "✓ \(quiz(item.quizId)?.scoreText(item.answers) ?? "") · \(Self.short(name))", tone: .good)
             if Date().timeIntervalSince(shown.at) < 1.6 { setPill(captureShown!.pill) }
         }
     }
 
+    /// Adds the sheet's handwriting to what the phone knows of the student's writing, and now and then catches up with
+    /// the server: fixes made later (here or in the portal) move the sample, and older sheets are learned too.
+    private func learn(_ item: ScanItem, _ handwriting: [Float]?) {
+        let session = store.session, user = session?.userId ?? "local"
+        Task {
+            await HandwritingMemory.shared.remember(item.id, studentId: item.studentId, print: handwriting, user: user)
+            if let session, session.expiresAt > Date().addingTimeInterval(120) {
+                await HandwritingMemory.shared.sync(user: session.userId, token: session.accessToken)
+            }
+        }
+    }
+
     private func note(_ text: String) {
         note = text
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in if self?.note == text { self?.note = nil } }
+        let seconds = max(2.5, Double(text.count) / 18)   // long enough to read
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in if self?.note == text { self?.note = nil } }
     }
 
     // MARK: Fixing an item
@@ -549,21 +609,13 @@ final class ScanSession: ObservableObject {
         }
     }
 
-    /// Opens a batch item's card over the camera; scanning waits meanwhile.
-    func openCard(_ id: String) {
-        heldForCard = true
-        scanner.hold(true)
-        card = CardRef(id: id)
-    }
-
     // MARK: Review
 
     var unreviewed: Int { items.filter { !$0.decided }.count }
-    var undecided: Int { unreviewed }
-    var reviewItem: ScanItem? { reviewId.flatMap { id in items.first { $0.id == id } } }
 
+    /// Opens the review at a sheet, or (nil) at the first that needs a look.
     func openReview(at id: String? = nil) {
-        reviewId = id ?? items.first { !$0.decided }?.id
+        reviewId = id
         showReview = true
         scanner.stop()
     }
@@ -595,11 +647,6 @@ final class ScanSession: ObservableObject {
     }
 
     /// The next sheet after `id` that hasn't been approved or rejected, wrapping around.
-    func nextUndecided(after id: String) -> String? {
-        let i = items.firstIndex { $0.id == id } ?? -1
-        return (items.indices.filter { $0 > i && !items[$0].decided }.first.map { items[$0] } ?? items.first { !$0.decided })?.id
-    }
-
     /// Rescans one batch item: the camera captures just that test once, and the new scan takes its place.
     func startRescan(_ id: String) {
         guard let item = items.first(where: { $0.id == id }) else { return }

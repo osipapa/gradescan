@@ -37,19 +37,23 @@ The portal is live at **https://osipapa.github.io/gradescan/**. Every push to `m
 - **Copy image** pastes the answer box into your own test document.
 
 ## Grading a stack
-1. Open the app on the **Scan** tab and choose **Batch** or **Single** at the bottom. In Batch you can lay several sheets out and scan them all at once.
-2. Hold the phone over a sheet. The outline fills in as it locks on; when it's steady it buzzes once and shows the score. A sheet is captured once: it won't capture again until that sheet is out of view or a different one is under the camera.
-3. **Batch:** put the next sheets down; the tray counts them. Tap **Review** (or a thumbnail) and swipe through the sheets: **Next** when a sheet looks right, the trash can to delete a bad capture (instant; swipe back to undo), or **Rescan**. The **×** in the tray discards the whole batch.
-4. **Single:** the result opens right away with **Rescan** or **Next sheet**.
-5. On each sheet photo the phone draws a ✓ or ✗ by every number, so you can copy them onto the paper. Rows it couldn't call are outlined with an amber dot; tap **Right** or **Wrong** and the mark on the photo updates. **Undo** takes it back.
-6. The name is matched to your class list even when the handwriting reads a little off ("roah Sim" is Noah Kim). A clear match is filled in; a likely one asks you to confirm with one tap.
-7. If a student ends up with two scans for a test, nothing is replaced: both sheets show side by side with the differences outlined, and you keep one.
-8. Scores upload as soon as each sheet is read. The portal shows the same photos, marks and decisions, and you can settle rows there too.
+1. Open the app on the **Scan** tab and choose **Single**, **Batch** or **Stand** at the bottom. In Batch you can lay several sheets out and scan them all at once. The first time, a **Get set up** panel walks you through importing your class and scanning an answer key.
+2. Hold the phone over a sheet. The outline fills in as it locks on; when it's steady it buzzes once and shows the score. A sheet is captured once: it won't capture again while it's in view, nor when it's found again after a moment out of sight (the same answers and handwriting in the same place). A different sheet laid on top is captured, even with the same answers, when its handwritten name differs.
+   - When nothing locks on, it says why: **Move closer**, **Glare on the sheet**, **Too dark** (the flashlight comes on by itself unless you turned it off), or **Keep all four corners in view**. A sheet whose corner goes under your thumb stays outlined but isn't captured until all four corners show.
+3. **Batch:** put the next sheets down; the tray counts them. Tap **Review**: it opens on the sheets that need you (a row to decide, a name to confirm, a duplicate, a period that doesn't match). **Next** when a sheet looks right, the trash can to delete a bad capture (instant; swipe back to undo), or **Rescan**. The sheets that read cleanly are counted at the end, to look through only if you want. The **×** in the tray discards the whole batch.
+4. **Stand:** batch with the phone propped up over the table (a stand, or leaning on something). Slide the sheets under it one after another and listen for a soft tick for each, even with the ringer off.
+5. **Single:** the result opens right away with **Rescan** or **Next sheet**.
+6. On each sheet photo the phone draws a ✓ or ✗ by every number, so you can copy them onto the paper. Rows it couldn't call are outlined with an amber dot; tap **Right** or **Wrong** and the mark on the photo updates. **Undo** takes it back.
+7. The name is matched to your class list even when the handwriting reads a little off ("roah Sim" is Noah Kim), is a nickname ("Tori" for Victoria), or is written last name first. A clear match is filled in; a likely one asks you to confirm with one tap.
+   - The phone also learns each student's handwriting. Every sheet that ends up with a student, whether matched on the phone, confirmed by you, or fixed in the portal, teaches it what that student's name looks like. From the second test on, most names are filled in even when the letters don't read. Fixing a wrong match also fixes what it learned.
+8. If a student ends up with two scans for a test, nothing is replaced: both sheets show side by side with the differences outlined, and you keep one.
+9. Scores upload as soon as each sheet is read. The portal shows the same photos, marks and decisions, and you can settle rows there too.
 
 ## Students and Settings on the phone
 - **Students** tab: the class list by period (chips at the top), with each student's average. Tap a student to edit their name or period (saved as you type) and see every score and their weakest topics.
 - **Import from Jupiter** (the **+** on the Students tab): point the camera at a class page in Jupiter. The names are read live, and once the list holds steady they're added to the period that's highlighted on the page (it asks when it can't tell). Open another class and it's added too; **Undo** takes an import back. A screenshot works as well.
 - **Settings** tab: your account, and which mode scanning starts in. Tests reload and uploads retry on their own.
+- **Help improve scanning** (Settings): turns on a button on the camera that saves what it sees when a sheet won't scan. The frames stay on the phone until you share them from Settings (AirDrop them to a Mac) to get scanning fixed for them.
 - **Delete all my data** (Settings › Testing) is for testing only and will be removed before release.
 
 ## ZipGrade sheets
@@ -100,4 +104,5 @@ To get a plain list of scores instead, choose **Export › Download CSV**.
 ## Privacy
 - Row-level security means only her login can read the data.
 - Student names, a small picture of each handwritten name, and a marked-up picture of each sheet are stored in your Supabase project. Handwriting is read on the phone; nothing goes to other services.
+- To recognize handwriting, the phone keeps a list of numbers describing each student's written name from their last few sheets. It isn't a picture, and it stays on the phone.
 - Check the district's rules on storing student data in personal apps.

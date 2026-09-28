@@ -16,6 +16,7 @@ final class AppStore: ObservableObject {
     @Published var pending: [ScanUpload] = []
     @Published var problem: String?
     @Published var tab: Tab = .scan
+    @Published var importingClass = false   // the Jupiter class import is open (on the Students tab)
 
     /// Local photos still shown on the phone; the upload queue keeps them after uploading.
     var keepPhotos: Set<String> = []
@@ -129,6 +130,25 @@ final class AppStore: ObservableObject {
         }
     }
 
+    /// Saves a fixed answer key, like the portal's "Save and regrade". Scores come from the key, so the test's scans
+    /// regrade everywhere, and the scanner picks up the new key through `tests`.
+    func updateKey(_ quiz: Quiz, key: String) async -> Bool {
+        do {
+            let token = try await validToken()
+            try await API.updateKey(quiz.id, key: key, token)
+            if let i = tests.firstIndex(where: { $0.id == quiz.id }) {
+                let q = tests[i]
+                tests[i] = Quiz(id: q.id, title: q.title, numQuestions: q.numQuestions, numChoices: q.numChoices, answerKey: key,
+                                pointsPerQuestion: q.pointsPerQuestion, bonusCount: q.bonusCount, layout: q.layout, code: q.code,
+                                questionTags: q.questionTags)
+            }
+            return true
+        } catch {
+            problem = error.localizedDescription
+            return false
+        }
+    }
+
     /// A test's scans from the server, plus any still waiting to upload.
     func scans(for quiz: Quiz) async throws -> [ScanRecord] {
         let token = try await validToken()
@@ -166,6 +186,12 @@ final class AppStore: ObservableObject {
     }
 
     // MARK: Class list
+
+    /// Straight to importing the class list, from wherever a name is being picked.
+    func startClassImport() {
+        tab = .students
+        importingClass = true
+    }
 
     /// Adds students (skipping anyone already on the list for that period). Returns how many were added.
     func addStudents(_ list: [(name: String, period: Int?)]) async -> Int {

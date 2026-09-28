@@ -294,6 +294,12 @@ enum API {
         return quiz
     }
 
+    static func updateKey(_ quizId: String, key: String, _ token: String) async throws {
+        struct Row: Encodable { let answerKey: String }
+        _ = try await request("/rest/v1/quizzes?id=eq.\(quizId)", method: "PATCH", token: token,
+                              body: try encoder.encode(Row(answerKey: key)), prefer: "return=minimal")
+    }
+
     static func insert(_ scan: ScanUpload, _ token: String) async throws {
         var row = scan
         row.localPhoto = nil   // phone-only

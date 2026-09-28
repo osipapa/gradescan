@@ -34,7 +34,6 @@ struct SheetLayout: Codable, Sendable {
     /// How dark a stroke past the circle must be to count. Where printed grey circles sit close by (ZipGrade),
     /// only pen and pencil dark enough to stand out from them count.
     var armsContrast: Double { tight ? 0.4 : Reader.inkContrast }
-    var markerPoint: CGPoint { Self.point(marker) }
 
     func bubble(_ question: Int, _ choice: Int) -> CGPoint? {
         guard question < questions.count, choice < questions[question].count else { return nil }
@@ -135,26 +134,6 @@ struct GrayStrip: Sendable {
                        provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
     }
 
-    /// A coarse 16×2 picture of the strip (0 = ink, 1 = paper), used to tell two sheets apart.
-    func signature() -> [Double] {
-        let cols = 16, rows = 2
-        var sums = [Double](repeating: 0, count: cols * rows), counts = [Int](repeating: 0, count: cols * rows)
-        for y in 0..<height {
-            for x in 0..<width {
-                let cell = (y * rows / height) * cols + x * cols / width
-                sums[cell] += Double(pixels[y * width + x]) / 255
-                counts[cell] += 1
-            }
-        }
-        return zip(sums, counts).map { $1 > 0 ? $0 / Double($1) : 1 }
-    }
-
-    /// How different two signatures are: 0 for the same picture, larger for different handwriting.
-    static func difference(_ a: [Double], _ b: [Double]) -> Double {
-        guard a.count == b.count, !a.isEmpty else { return 1 }
-        return zip(a, b).reduce(0) { $0 + abs($1.0 - $1.1) } / Double(a.count)
-    }
-
     /// JPEG as a data URL, ready to store in the scans table and show in the portal.
     func jpegDataURL(quality: Double = 0.7) -> String? {
         guard let image = cgImage() else { return nil }
@@ -185,8 +164,16 @@ enum Reader {
     static func studentNumber(_ img: LumaImage, _ unit: Homography) -> Int? { code(img, unit, row: 0) }
 
     private static func code(_ img: LumaImage, _ unit: Homography, row v: Double, strict: Bool = false) -> Int? {
+        // Where the corners put the row, then a little above and below it: a curled or tilted sheet bends it.
+        for dv in [0, -0.005, 0.005, -0.01, 0.01] {
+            if let code = code(img, unit, v + dv, strict: strict) { return code }
+        }
+        return nil
+    }
+
+    private static func code(_ img: LumaImage, _ unit: Homography, _ v: Double, strict: Bool) -> Int? {
         let width = Double(img.width), height = Double(img.height)
-        var word = 0
+        var contrasts: [Double] = []
         for i in 0..<16 {
             let u = 0.2 + Double(i) * 0.04
             let c = unit.apply(CGPoint(x: u, y: v)), next = unit.apply(CGPoint(x: u + 0.04, y: v))
@@ -205,8 +192,16 @@ enum Reader {
                 let gap = unit.apply(CGPoint(x: u + 0.02, y: v))   // between this square and the next
                 guard i == 15 || 1 - img.at(gap) / paper <= 0.15 else { return nil }
             }
-            if contrast >= 0.35 { word |= 1 << i }
+            contrasts.append(contrast)
         }
+        // Printed squares and blank paper, told apart by the widest gap between their contrasts, so a soft or
+        // dim picture (squares at 0.3 rather than 0.8) still reads. No clear gap, no code.
+        let sorted = contrasts.sorted()
+        guard let split = (1..<sorted.count).max(by: { sorted[$0] - sorted[$0 - 1] < sorted[$1] - sorted[$1 - 1] }),
+              sorted[split] - sorted[split - 1] >= 0.15, sorted[split - 1] <= 0.3, sorted[split] >= 0.25 else { return nil }
+        let threshold = (sorted[split] + sorted[split - 1]) / 2
+        var word = 0
+        for (i, contrast) in contrasts.enumerated() where contrast >= threshold { word |= 1 << i }
         let code = word & 4095, check = word >> 12
         guard code > 0, check == (code & 15) ^ ((code >> 4) & 15) ^ ((code >> 8) & 15) ^ 10 else { return nil }
         return code
@@ -491,11 +486,6 @@ enum Reader {
         let span = Double(hi - lo)
         let pixels = values.map { UInt8(clamping: Int(((Double($0) - Double(lo)) / span * 255).rounded())) }
         return GrayStrip(width: width, height: height, pixels: pixels)
-    }
-
-    /// The sheet straightened and cropped, with the marks drawn on, as a JPEG data URL.
-    static func sheetPicture(_ layout: SheetLayout, _ marks: [Mark], _ img: LumaImage, _ h: Homography, pixelsPerInch ppi: Double = 90) -> String? {
-        sheetJPEG(layout, marks, img, h, pixelsPerInch: ppi).map { "data:image/jpeg;base64," + $0.base64EncodedString() }
     }
 
     /// The sheet straightened and cropped, with the marks drawn on, as JPEG data.

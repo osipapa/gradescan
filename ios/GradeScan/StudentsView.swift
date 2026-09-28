@@ -6,7 +6,6 @@ struct StudentsView: View {
     @State private var filter: Int? = nil   // a period; nil shows every period
     @State private var search = ""
     @State private var adding = false
-    @State private var importing = false
     @State private var removing: Student?
 
     private struct Group: Identifiable {
@@ -41,7 +40,7 @@ struct StudentsView: View {
                     } description: {
                         Text("Take a photo of a class page in Jupiter, or add names one by one.")
                     } actions: {
-                        Button("Import from Jupiter") { importing = true }.buttonStyle(.bordered)
+                        Button("Import from Jupiter") { store.importingClass = true }.buttonStyle(.bordered)
                     }
                 }
                 ForEach(groups) { group in
@@ -70,14 +69,14 @@ struct StudentsView: View {
                 ToolbarItem(placement: .primaryAction) {
                     Menu {
                         Button("Add a student", systemImage: "person.badge.plus") { adding = true }
-                        Button("Import from Jupiter", systemImage: "camera.viewfinder") { importing = true }
+                        Button("Import from Jupiter", systemImage: "camera.viewfinder") { store.importingClass = true }
                     } label: {
                         Label("Add", systemImage: "plus")
                     }
                 }
             }
             .sheet(isPresented: $adding) { StudentForm().environmentObject(store) }
-            .fullScreenCover(isPresented: $importing) { RosterScanView().environmentObject(store) }
+            .fullScreenCover(isPresented: $store.importingClass) { RosterScanView().environmentObject(store) }
             .confirmationDialog("Remove \(removing?.name ?? "")?", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }),
                                 titleVisibility: .visible) {
                 Button("Remove", role: .destructive) {

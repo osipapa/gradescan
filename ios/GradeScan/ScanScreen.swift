@@ -5,6 +5,9 @@ struct ScanScreen: View {
     @EnvironmentObject var store: AppStore
     @EnvironmentObject var scan: ScanSession
     @State private var confirmDiscardBatch = false
+    @State private var creatingTest = false
+    @AppStorage("setupDismissed") private var setupDismissed = false
+    @AppStorage("saveProblemFrames") private var saveProblemFrames = false
 
     var body: some View {
         ZStack {
@@ -27,6 +30,7 @@ struct ScanScreen: View {
                     .foregroundStyle(.white)
                     .glassCapsule()
                 }
+                if showSetup { setupPanel }
                 if scan.zipgradeNeedsTest && scan.rescanning == nil { zipgradePrompt } else { pill }
                 if store.problem != nil && !store.pending.isEmpty {
                     Text("\(store.pending.count) waiting to upload. It keeps trying.").font(.footnote).foregroundStyle(.white.opacity(0.85))
@@ -35,7 +39,7 @@ struct ScanScreen: View {
                     Text("Uploading \(store.pending.count)…").font(.footnote).foregroundStyle(.white.opacity(0.85))
                 }
                 if scan.rescanning == nil && !scan.capturingKey {
-                    if scan.mode == .batch { tray } else if !scan.items.isEmpty { reviewBatchButton }
+                    if !scan.items.isEmpty { if scan.mode == .single { reviewBatchButton } else { tray } }
                     modePicker
                 }
             }
@@ -81,8 +85,68 @@ struct ScanScreen: View {
             .glassCapsule()
             .accessibilityLabel(scan.torch ? "Turn flashlight off" : "Turn flashlight on")
             Spacer()
+            if saveProblemFrames {
+                Button { scan.saveProblemFrame() } label: {
+                    Image(systemName: "exclamationmark.bubble").font(.title3).frame(width: 46, height: 46)
+                }
+                .glassCapsule()
+                .accessibilityLabel("Save this frame")
+            }
         }
         .foregroundStyle(.white)
+    }
+
+    /// First time, with no class list or no tests yet: the three steps to get going.
+    private var showSetup: Bool {
+        store.loaded && (store.tests.isEmpty || store.students.isEmpty) && !setupDismissed && scan.items.isEmpty
+            && !scan.capturingKey && scan.rescanning == nil && !scan.zipgradeNeedsTest
+    }
+
+    private var setupPanel: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("Get set up").font(.headline)
+                Spacer()
+                Button("Not now") { setupDismissed = true }.font(.subheadline)
+            }
+            setupStep(1, "Import your class", "Point the camera at a class page in Jupiter", done: !store.students.isEmpty, action: "Import") {
+                store.startClassImport()
+            }
+            setupStep(2, "Scan an answer key", "A ZipGrade sheet with every answer right", done: !store.tests.isEmpty, action: "Scan") {
+                scan.startKeyCapture()
+            }
+            if store.tests.isEmpty {
+                Button("Or set up a test by hand") { creatingTest = true }.font(.caption.weight(.medium)).padding(.leading, 40)
+            }
+            setupStep(3, "Scan the stack", "Point at your students' sheets", done: false, action: nil) {}
+        }
+        .foregroundStyle(.white)
+        .padding(16)
+        .glassPanel()
+        .sheet(isPresented: $creatingTest) { NewTestView().environmentObject(store) }
+    }
+
+    private func setupStep(_ number: Int, _ title: String, _ detail: String, done: Bool, action: String?, perform: @escaping () -> Void) -> some View {
+        HStack(spacing: 12) {
+            ZStack {
+                Circle().fill(done ? Brand.sage : Color.white.opacity(0.18)).frame(width: 28, height: 28)
+                if done { Image(systemName: "checkmark").font(.caption.bold()).foregroundStyle(Brand.onSage) }
+                else { Text("\(number)").font(.subheadline.bold()) }
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.subheadline.weight(.semibold))
+                Text(detail).font(.caption).foregroundStyle(.white.opacity(0.8))
+            }
+            .opacity(done ? 0.6 : 1)
+            Spacer()
+            if let action, !done {
+                Button(action, action: perform)
+                    .font(.subheadline.bold())
+                    .padding(.horizontal, 14).padding(.vertical, 7)
+                    .background(Brand.sage, in: Capsule())
+                    .foregroundStyle(Brand.onSage)
+            }
+        }
     }
 
     /// A ZipGrade sheet is in view and this batch has no test for it yet.
@@ -91,7 +155,7 @@ struct ScanScreen: View {
         return VStack(alignment: .leading, spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("ZipGrade sheet").font(.headline)
-                Text(hasTests ? "Which test is it for?" : "Set up its test from an answer key: a sheet with every answer right.")
+                Text(hasTests ? "Which test is it for?" : "Set up its test from an answer key, or a student's sheet that's nearly right. You can fix answers after.")
                     .font(.subheadline).foregroundStyle(.white.opacity(0.85))
             }
             HStack(spacing: 10) {
@@ -115,7 +179,7 @@ struct ScanScreen: View {
             Image(systemName: "key").font(.title3)
             VStack(alignment: .leading, spacing: 2) {
                 Text("Answer key").font(.headline)
-                Text("Hold up a sheet with every answer right").font(.caption).lineLimit(1)
+                Text("Hold up the key, or a sheet that's nearly right").font(.caption).lineLimit(1)
             }
             Spacer()
             Button("Cancel") { scan.cancelKeyCapture() }.bold()
@@ -163,28 +227,21 @@ struct ScanScreen: View {
 
     private var tray: some View {
         HStack(spacing: 8) {
-            if scan.items.isEmpty {
-                Text("Scan your sheets")
-                    .font(.footnote).foregroundStyle(.white.opacity(0.9))
-                    .frame(maxWidth: .infinity, alignment: .center)
-                    .padding(.vertical, 8)
-            } else {
-                Button { confirmDiscardBatch = true } label: {
-                    Image(systemName: "xmark").font(.subheadline.weight(.semibold)).frame(width: 30, height: 44)
-                }
-                .foregroundStyle(.white.opacity(0.85))
-                .accessibilityLabel("Discard batch")
-                ForEach(scan.items.suffix(4)) { item in
-                    Button { scan.openReview(at: item.id) } label: { Thumb(item: item) }
-                }
-                Text("\(scan.items.count)").font(.headline.monospacedDigit()).foregroundStyle(.white).padding(.leading, 2)
-                Spacer()
-                Button { scan.openReview() } label: {
-                    Text("Review").font(.headline).padding(.horizontal, 22).padding(.vertical, 11)
-                }
-                .background(Brand.sage, in: Capsule())
-                .foregroundStyle(Brand.onSage)
+            Button { confirmDiscardBatch = true } label: {
+                Image(systemName: "xmark").font(.subheadline.weight(.semibold)).frame(width: 30, height: 44)
             }
+            .foregroundStyle(.white.opacity(0.85))
+            .accessibilityLabel("Discard batch")
+            ForEach(scan.items.suffix(4)) { item in
+                Button { scan.openReview(at: item.id) } label: { Thumb(item: item) }
+            }
+            Text("\(scan.items.count)").font(.headline.monospacedDigit()).foregroundStyle(.white).padding(.leading, 2)
+            Spacer()
+            Button { scan.openReview() } label: {
+                Text("Review").font(.headline).padding(.horizontal, 22).padding(.vertical, 11)
+            }
+            .background(Brand.sage, in: Capsule())
+            .foregroundStyle(Brand.onSage)
         }
         .padding(10)
         .glassPanel()
@@ -203,9 +260,10 @@ struct ScanScreen: View {
         Picker("Mode", selection: $scan.mode) {
             Text("Single").tag(ScanSession.Mode.single)
             Text("Batch").tag(ScanSession.Mode.batch)
+            Text("Stand").tag(ScanSession.Mode.stand)
         }
         .pickerStyle(.segmented)
-        .frame(width: 220)
+        .frame(width: 270)
         .padding(6)
         .glassCapsule()
     }
@@ -255,6 +313,7 @@ struct ZipGradeTestPicker: View {
     @Environment(\.dismiss) private var dismiss
     @State private var creating = false
     @State private var before: Set<String> = []
+    @State private var editingKey: Quiz?
 
     var body: some View {
         NavigationStack {
@@ -267,18 +326,26 @@ struct ZipGradeTestPicker: View {
                     let fitting = store.tests.filter(ZipGrade.fits)
                     if fitting.isEmpty { Text("No tests with 20 questions or fewer yet.").foregroundStyle(.secondary) }
                     ForEach(fitting) { test in
-                        Button {
-                            scan.zipgradeQuizId = test.id
-                            dismiss()
-                        } label: {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(test.title).foregroundStyle(.primary)
-                                    Text(test.summary).font(.caption).foregroundStyle(.secondary)
+                        HStack(spacing: 14) {
+                            Button {
+                                scan.zipgradeQuizId = test.id
+                                dismiss()
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(test.title).foregroundStyle(.primary)
+                                        Text(test.summary).font(.caption).foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if test.id == scan.zipgradeQuizId { Image(systemName: "checkmark").foregroundStyle(Brand.sageStrong) }
                                 }
-                                Spacer()
-                                if test.id == scan.zipgradeQuizId { Image(systemName: "checkmark").foregroundStyle(Brand.sageStrong) }
+                                .contentShape(Rectangle())
                             }
+                            .buttonStyle(.borderless)
+                            Button { editingKey = test } label: { Image(systemName: "pencil") }
+                                .buttonStyle(.borderless)
+                                .foregroundStyle(Brand.sageStrong)
+                                .accessibilityLabel("Edit answer key")
                         }
                     }
                 }
@@ -289,12 +356,13 @@ struct ZipGradeTestPicker: View {
                         creating = true
                     }
                 } footer: {
-                    Text("From an answer key: hold up a sheet with every answer right, then name the test.")
+                    Text("Hold up an answer key, or a student's sheet that's nearly right, then fix any wrong answers and name the test. The pencil fixes a test's key.")
                 }
             }
             .navigationTitle("ZipGrade sheets")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
+            .sheet(item: $editingKey) { KeyEditView(quiz: $0).environmentObject(store) }
             .sheet(isPresented: $creating, onDismiss: {
                 // A test just created here is the one for this stack.
                 if let new = store.tests.first(where: { !before.contains($0.id) }), ZipGrade.fits(new) {
